@@ -1,0 +1,9 @@
+indi.yaml
+*.csv
+analysis/*.png
+!analysis/error_vs_dec.png
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/
+CLAUDE.md
