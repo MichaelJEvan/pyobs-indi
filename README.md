@@ -29,6 +29,32 @@ Park, unpark and abort each wait for the signal that actually means the
 operation finished, instead of a timer. Park can be aborted mid-swing. An
 aborted slew is reported as aborted, never as an arrival.
 
+The meridian flip is automatic. A ZWO mount never flips on its own: it
+tracks a few minutes past the meridian (3.6 minutes on my AM3N, measured),
+stops, and then refuses to track until a goto re-acquires the target from
+the other side of the pier. Every client that "does meridian flips" is
+really just sending that goto at the right moment, which is how NINA and
+Ekos do it, so this module does the same. It watches the tracked target's
+hour angle and re-slews about 30 seconds after the crossing, while the
+firmware is still tracking, so the target is never dropped. The flip only
+fires when the pier side shows the mount has not flipped yet, never during
+a slew or a park, and a mount you stopped stays stopped. First automatic
+flip on the real mount was 2026-08-31: back on target 1.0 arcsec off after
+a 34 second swing at Dec +88. Set auto_flip false in the config to turn it
+off.
+
+Worth understanding why the firmware is this stubborn: a German mount
+tracking past the meridian is slowly winding the telescope into its own
+pier, and a mount that keeps obeying track commands will eventually press
+the scope into the metal at tracking speed. That is the classic pier
+crash, and older worm-drive mounts really will do it. The AM firmware
+makes it impossible: it stops tracking past the line, refuses to restart,
+and picks a safe pier side on every goto. So the firmware guards the
+hardware and this module guards the night; the worst a software failure
+can cost on this mount is a stopped mount and a lost target, not bent
+metal. A mount without that firmware protection would need those limits
+enforced in software before anything here is pointed at it.
+
 Tracking modes (ITrackingMode): sidereal, solar, lunar, and off. Off is the
 important one. INDI's abort puts the mount back to whatever it was doing
 before the move, which usually means it is still tracking. TRACK_OFF is the
@@ -121,9 +147,10 @@ python tests/test_epoch.py
 python tests/test_reconnect.py
 python tests/test_motion_commands.py
 python tests/test_site_time_tracking.py
+python tests/test_meridian_flip.py
 ```
 
-Thirty tests, none of which need pyobs, INDI or a mount running. The fake
+Forty tests, none of which need pyobs, INDI or a mount running. The fake
 mount in them is deliberately unpleasant: it takes time to move, creeps at
 sidereal rate when "still", takes a moment to acknowledge commands, answers
 a no-op with a message and no property update, and can accept an order and
@@ -132,8 +159,9 @@ became a test.
 
 ## Status
 
-Working, in use against a ZWO AM3N. Not done yet: pier side reporting,
-alt/az moves, custom tracking rates, homing.
+Working, in use against a ZWO AM3N. Not done yet: alt/az moves, custom
+tracking rates, homing. Pier side is read for the meridian flip but not yet
+reported through a pyobs interface.
 
 ## Related repos
 

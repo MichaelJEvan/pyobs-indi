@@ -53,6 +53,14 @@ ARRIVAL_TOLERANCE = 3600.0  # arcsec; beyond this a "finished" slew is a failure
 STILL_TOLERANCE = 30.0      # arcsec between reads to count as not moving.
                             # Sidereal creep is ~15 arcsec/s, a slew is
                             # thousands; this sits between them.
+FLIP_POLL = 5.0             # meridian watcher check interval
+FLIP_MARGIN = 30.0          # seconds past the meridian before the flip goto
+                            # goes out. The AM5 firmware keeps tracking about
+                            # 3.6 minutes past the line before stopping
+                            # (measured 2026-08-31), so this fires while the
+                            # mount is still tracking and no time is lost.
+FLIP_RETRIES = 3            # failed flip attempts per crossing before giving up
+FLIP_RETRY_DELAY = 60.0     # seconds between those attempts
 
 LOG_COLUMNS = ["time", "event", "ra_j2000", "dec_j2000", "ra_eod_h", "dec_eod",
                "ra_reported_h", "dec_reported", "arcsec_off", "note"]
@@ -89,6 +97,7 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
     def __init__(self, host: str, device: str, port: int = 7624,
                  settle_time: float = 1.0, arrival_tolerance: float = ARRIVAL_TOLERANCE,
                  log_file: str | None = "analysis/indi-log.csv",
+                 auto_flip: bool = True,
                  **kwargs: Any) -> None:
         """
         Args:
@@ -96,6 +105,10 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
             device: INDI device name, e.g. "Telescope Simulator" or "ZWO AM5".
             port: indiserver port.
             settle_time: seconds to wait after a slew reports complete.
+            auto_flip: perform the meridian flip automatically. The mount
+                never flips on its own (see _meridian_watch); with this off,
+                a tracked target is dropped a few minutes past the meridian
+                until someone re-slews by hand.
             arrival_tolerance: arcsec. A slew ending further than this from
                 its target is treated as a failure (limit hit, refusal, or an
                 untracked stop). Default is loose because an unmodelled real
@@ -123,10 +136,14 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         # to make it hold still.
         self._tracking_modes = [TrackingMode.SIDEREAL, TrackingMode.SOLAR,
                                 TrackingMode.LUNAR, TrackingMode.OFF]
+        self._auto_flip = auto_flip
+        self._flip_attempts = 0
+        self._no_pier_warned = False
         # Re-send site/time after every reconnect, not just the first
         # connect: a restarted driver resets to LAT=0/LONG=0.
         self._indi.on_connected = self._sync_site_and_time
         self.add_background_task(self._update_position)
+        self.add_background_task(self._meridian_watch)
 
     @property
     def _position_radec(self) -> tuple[float, float] | None:
@@ -231,6 +248,84 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
             if status != self.motion_status():
                 await self._change_motion_status(status)
             await asyncio.sleep(POSITION_INTERVAL)
+
+    def _seconds_past_meridian(self) -> float | None:
+        """Seconds since the tracked target crossed the meridian; negative before.
+
+        Hour angle of the target (not of the mount): LST minus the target's
+        equinox-of-date RA. Uses sidereal seconds, which differ from clock
+        seconds by 0.3%; irrelevant at this precision.
+        """
+        if self._target is None or self._observer is None:
+            return None
+        ra_h, _ = j2000_to_eod(*self._target)
+        lst = Time.now().sidereal_time("apparent",
+                                       longitude=self._observer.location.lon)
+        ha_h = (float(lst.hourangle) - ra_h + 12.0) % 24.0 - 12.0
+        return ha_h * 3600.0
+
+    def _flip_due(self) -> bool:
+        """Decide whether the meridian-flip goto should go out now.
+
+        Requires: a tracked target past the meridian by FLIP_MARGIN, the
+        mount still on the west pier side (i.e. not yet flipped), and no
+        slew or park in progress. TRACKING or IDLE both qualify: the
+        firmware stops tracking a few minutes past the line, so a mount
+        that already gave up still needs the flip.
+        """
+        if not self._auto_flip or self._target is None or not self._indi.connected:
+            return False
+        if self.motion_status() not in (MotionStatus.TRACKING, MotionStatus.IDLE):
+            return False
+        pier = self._indi.switch_on("TELESCOPE_PIER_SIDE")
+        if pier is None:
+            if not self._no_pier_warned:
+                log.warning("indi       driver does not report pier side; "
+                            "automatic meridian flip is off")
+                self._no_pier_warned = True
+            return False
+        past = self._seconds_past_meridian()
+        if past is None:
+            return False
+        if pier != "PIER_WEST" or past < 0.0:
+            self._flip_attempts = 0      # crossing over, or not begun: re-arm
+            return False
+        if self._flip_attempts >= FLIP_RETRIES:
+            return False                 # gave up on this crossing
+        return past >= FLIP_MARGIN
+
+    async def _meridian_watch(self) -> None:
+        """Background task: perform the meridian flip the mount never will.
+
+        Measured on the AM3N 2026-08-31, and confirmed by the INDI forum's
+        AM5 threads: the firmware tracks ~3.6 minutes past the meridian,
+        stops, and refuses TRACK_ON until a goto re-acquires the target from
+        the other pier side. It never flips by itself; the flip is always
+        the client's job (Ekos and NINA both send a goto to the current
+        target at HA 0). This is that client. The goto goes through the
+        normal move_radec path, so the altitude check, motion status, events
+        and the CSV log all behave as for any other slew.
+        """
+        while True:
+            await asyncio.sleep(FLIP_POLL)
+            if not self._flip_due():
+                continue
+            ra, dec = self._target
+            log.info("indi       target crossed the meridian; flipping the mount")
+            try:
+                await self.move_radec(ra, dec)
+                log.info("indi       meridian flip complete; tracking resumed")
+                self._flip_attempts = 0
+            except Exception as err:
+                self._flip_attempts += 1
+                if self._flip_attempts >= FLIP_RETRIES:
+                    log.error("indi       meridian flip failed %d times (%s); "
+                              "giving up until the next crossing",
+                              self._flip_attempts, err)
+                else:
+                    log.warning("indi       meridian flip failed (%s); "
+                                "retrying in %.0f s", err, FLIP_RETRY_DELAY)
+                    await asyncio.sleep(FLIP_RETRY_DELAY)
 
     async def _move_radec(self, ra: float, dec: float, abort_event: asyncio.Event) -> None:
         """Slew and wait for arrival.
@@ -427,7 +522,17 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
             await self._indi.set_switch("TELESCOPE_TRACK_STATE", "TRACK_ON")
             ok = await self._settled_on_switch("TELESCOPE_TRACK_STATE", "TRACK_ON")
         if not ok:
-            raise exc.MoveError(f"mount did not confirm tracking mode {mode}")
+            # Not fatal. The AM5 firmware refuses TRACK_ON while the mount
+            # sits past the meridian un-flipped (measured 2026-08-31), and
+            # pyobs resets tracking before every slew -- so raising here
+            # killed the very goto that performs the flip and cures the
+            # refusal. Warn, report the mount's actual state, carry on.
+            log.warning("indi       mount did not confirm tracking mode %s; "
+                        "continuing (a goto restores tracking after a "
+                        "meridian flip)", mode)
+            await self.comm.set_state(
+                ITrackingMode, TrackingModeState(mode=self._tracking_mode_now()))
+            return
         await self.comm.set_state(ITrackingMode, TrackingModeState(mode=mode))
 
     async def stop_motion(self, device: str | None = None, **kwargs: Any) -> None:
@@ -435,6 +540,9 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         # otherwise indistinguishable (both end the Busy state), and an
         # aborted slew must not be reported as a success.
         self._aborted = True
+        # A stopped mount must stay stopped: without this the meridian
+        # watcher would happily re-slew to the abandoned target.
+        self._target = None
         await self._indi.set_switch("TELESCOPE_ABORT_MOTION", "ABORT")
         await self._change_motion_status(await self._get_status())
 
@@ -465,6 +573,7 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         """
         self._aborted = False
         self._parking = True
+        self._target = None      # a parked mount has nothing to flip to
         try:
             await self._change_motion_status(MotionStatus.PARKING)
             await self._indi.set_switch("TELESCOPE_PARK", "PARK")

@@ -57,6 +57,12 @@ Watch the log for `connected to 'ZWO AM5'` and the `sent site ... and UTC`
 line: that second one is the module fixing the mount's clock (a cold ZWO
 boots thinking it is January 2000) and its elevation.
 
+When a tracked target crosses the meridian the module flips the mount by
+itself about 30 seconds later; the log says `flipping the mount` and then
+`meridian flip complete`. No action needed. The mount never flips on its
+own, so if this module is not running, a tracking mount stops a few
+minutes past the meridian and sits there.
+
 ### 5. Stellarium bridge for the real mount
 
 Window stays busy; leave it running. Serves port 10002.

@@ -8,6 +8,7 @@ class: pyobs_indi.IndiTelescope
 host: ubuntu.orb.local
 device: Telescope Simulator
 port: 7624
+# auto_flip: true          # meridian flip is automatic; false to disable
 
 comm:
   class: pyobs.comm.xmpp.XmppComm
