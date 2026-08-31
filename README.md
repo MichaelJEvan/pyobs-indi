@@ -97,6 +97,10 @@ since the conversion under test is the same either way:
 
 ![arrival error vs declination](analysis/error_vs_dec.png)
 
+The two extreme outliers are aborted slews that an early version of the
+module recorded as arrivals; that bug was found in this data, fixed, and is
+now covered by tests. The points stay as an honest record.
+
 To be clear about what this measures: it is the difference between the
 commanded position and the position the mount reports back. That checks the
 software chain and the mount's encoders down to the arcsecond, but it is not
