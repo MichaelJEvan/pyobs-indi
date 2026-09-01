@@ -173,4 +173,6 @@ reported through a pyobs interface.
 
 ## License
 
-MIT
+MIT. The copyright notice travels with the code, as the license requires.
+Beyond that: if this module ends up in your software or your observatory,
+a mention and a link back here would be appreciated.
