@@ -55,7 +55,7 @@ can cost on this mount is a stopped mount and a lost target, not bent
 metal. A mount without that firmware protection would need those limits
 enforced in software before anything here is pointed at it.
 
-All ten automatic flips ever performed, on the real AM3N, in one
+All ten meridian flips performed, on the real AM3N, in one
 afternoon, with targets picked in Stellarium:
 
 ![automatic meridian flips](analysis/flips_timeline.png)
