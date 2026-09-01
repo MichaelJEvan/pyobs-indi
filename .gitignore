@@ -2,6 +2,8 @@ indi.yaml
 *.csv
 analysis/*.png
 !analysis/error_vs_dec.png
+!analysis/flips_timeline.png
+!analysis/flips_duration.png
 __pycache__/
 *.pyc
 .DS_Store

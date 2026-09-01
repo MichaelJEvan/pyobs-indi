@@ -55,6 +55,19 @@ can cost on this mount is a stopped mount and a lost target, not bent
 metal. A mount without that firmware protection would need those limits
 enforced in software before anything here is pointed at it.
 
+All ten automatic flips ever performed, on the real AM3N, in one
+afternoon, with targets picked in Stellarium:
+
+![automatic meridian flips](analysis/flips_timeline.png)
+![flip durations](analysis/flips_duration.png)
+
+Every flip re-acquired its target within the seeing. The north/south
+difference is geometry, not mechanics: a fixed encoder step covers fewer
+arcseconds of sky near the pole. Same caveat as the plot further down:
+this is the commanded position against what the mount reports back, not
+plate-solved sky pointing. analysis/plot_flips.py regenerates both from
+the slew log.
+
 Tracking modes (ITrackingMode): sidereal, solar, lunar, and off. Off is the
 important one. INDI's abort puts the mount back to whatever it was doing
 before the move, which usually means it is still tracking. TRACK_OFF is the
