@@ -68,6 +68,8 @@ def _flip_rig(seconds_past: float = 120.0, pier: str | None = "PIER_WEST"):
     t._auto_flip = True
     t._flip_attempts = 0
     t._no_pier_warned = False
+    t._flip_disarmed = False
+    t._flipping = False
     t._target = _target_at_ha(seconds_past)
     t.motion_status = lambda: MotionStatus.TRACKING
     return t
@@ -163,6 +165,37 @@ def test_stop_clears_the_flip_target() -> None:
         return t._target
 
     assert asyncio.run(run()) is None
+
+
+def test_abort_stands_the_watcher_down_even_if_target_reappears() -> None:
+    """The race that moved the mount after an abort (2026-09-01): stop_motion
+    clears _target, but a flip goto in flight re-sets it. The disarm latch
+    must win regardless, so _flip_due stays False even with a target set."""
+    async def run():
+        t = _flip_rig(seconds_past=120.0)
+        t._get_status = lambda: asyncio.sleep(0, result=MotionStatus.IDLE)
+        await t.stop_motion()                       # user aborts
+        t._target = _target_at_ha(120.0)            # a flip goto re-sets it
+        return t._flip_disarmed, t._flip_due()
+
+    disarmed, due = asyncio.run(run())
+    assert disarmed is True, "abort did not disarm the watcher"
+    assert due is False, "watcher re-armed after an abort despite a target"
+
+
+def test_a_deliberate_slew_rearms_the_watcher() -> None:
+    """The latch is not permanent: slewing somewhere new turns flips back on."""
+    async def run():
+        t = _flip_rig(seconds_past=120.0)
+        t._get_status = lambda: asyncio.sleep(0, result=MotionStatus.IDLE)
+        t._change_motion_status = _noop_status
+        await t.stop_motion()
+        assert t._flip_disarmed
+        # A user slew (not the watcher's own) must clear the latch.
+        await t._move_radec(*_target_at_ha(-30.0), asyncio.Event())
+        return t._flip_disarmed
+
+    assert asyncio.run(run()) is False, "a deliberate slew did not re-arm the watcher"
 
 
 def test_a_refused_tracking_reset_no_longer_raises() -> None:

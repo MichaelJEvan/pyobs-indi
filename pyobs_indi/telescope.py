@@ -139,6 +139,15 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         self._auto_flip = auto_flip
         self._flip_attempts = 0
         self._no_pier_warned = False
+        # A manual stop stands the auto-flip watcher down until the next
+        # deliberate slew. Without this, aborting a slew past the meridian
+        # races the watcher: stop_motion clears _target, but the watcher's
+        # own flip goto re-sets _target at slew start, so it re-armed and
+        # re-slewed a mount the user had just stopped -- two or three times
+        # (seen on the sim 2026-09-01, and it would move real iron back to
+        # life after an abort). This latch does not depend on that ordering.
+        self._flip_disarmed = False
+        self._flipping = False        # True only while the watcher's own goto runs
         # Re-send site/time after every reconnect, not just the first
         # connect: a restarted driver resets to LAT=0/LONG=0.
         self._indi.on_connected = self._sync_site_and_time
@@ -273,7 +282,8 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         firmware stops tracking a few minutes past the line, so a mount
         that already gave up still needs the flip.
         """
-        if not self._auto_flip or self._target is None or not self._indi.connected:
+        if (not self._auto_flip or self._flip_disarmed
+                or self._target is None or not self._indi.connected):
             return False
         if self.motion_status() not in (MotionStatus.TRACKING, MotionStatus.IDLE):
             return False
@@ -313,7 +323,13 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
             ra, dec = self._target
             log.info("indi       target crossed the meridian; flipping the mount")
             try:
-                await self.move_radec(ra, dec)
+                # Mark this goto as the watcher's own, so move_radec does not
+                # treat it as a user slew and re-arm the watcher it fired.
+                self._flipping = True
+                try:
+                    await self.move_radec(ra, dec)
+                finally:
+                    self._flipping = False
                 log.info("indi       meridian flip complete; tracking resumed")
                 self._flip_attempts = 0
             except Exception as err:
@@ -341,6 +357,10 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         ra_h, dec_eod = j2000_to_eod(ra, dec)
         self._target = (ra, dec)
         self._aborted = False
+        # A deliberate slew (user, scheduler, or a re-slew after an abort)
+        # re-arms the watcher; the watcher's own flip goto does not.
+        if not self._flipping:
+            self._flip_disarmed = False
         self._record("slew", ra_j2000=ra, dec_j2000=dec, ra_eod_h=ra_h, dec_eod=dec_eod)
 
         await self._indi.set_switch("ON_COORD_SET", "TRACK")
@@ -540,9 +560,11 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         # otherwise indistinguishable (both end the Busy state), and an
         # aborted slew must not be reported as a success.
         self._aborted = True
-        # A stopped mount must stay stopped: without this the meridian
-        # watcher would happily re-slew to the abandoned target.
+        # A stopped mount must stay stopped: clear the target and latch the
+        # watcher off, so a flip goto already in flight cannot re-arm it by
+        # re-setting _target. It comes back on the next deliberate slew.
         self._target = None
+        self._flip_disarmed = True
         await self._indi.set_switch("TELESCOPE_ABORT_MOTION", "ABORT")
         await self._change_motion_status(await self._get_status())
 

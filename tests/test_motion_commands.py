@@ -151,6 +151,8 @@ def _scope(travel_ticks: int = 5) -> IndiTelescope:
     t._cached = None
     t._aborted = False
     t._parking = False
+    t._flip_disarmed = False
+    t._flipping = False
     t._status = None
     return t
 
