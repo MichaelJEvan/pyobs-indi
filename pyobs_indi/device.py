@@ -142,7 +142,9 @@ class IndiDevice:
         self._reader, self._writer = await asyncio.wait_for(
             asyncio.open_connection(self._host, self._port), CONNECT_TIMEOUT)
         await self._send('<getProperties version="1.7"/>')
-        await self.set_switch("CONNECTION", "CONNECT")
+        # CONNECTION is switched on when the driver defines it -- see
+        # _absorb. Doing it here raced the definition (and a wait here
+        # would deadlock: _connect runs on the same task that reads).
 
     async def close(self) -> None:
         if self._task is not None:
@@ -268,6 +270,15 @@ class IndiDevice:
                 pass
         for element, value in _ONE.findall(match.group(3)):
             entry["values"][element] = value
+        # Connect the device the moment the driver defines CONNECTION.
+        # Setting it from _connect() raced the definition: on a freshly
+        # started driver the switch arrived first and was dropped with
+        # "dispatch error: Property CONNECTION is not defined" (Telescope
+        # Simulator, 2026-09-01). This runs on the reader task, so the
+        # send goes out as a task rather than blocking the loop.
+        if name == "CONNECTION" and entry["values"].get("CONNECT") != "On":
+            asyncio.get_running_loop().create_task(
+                self.set_switch("CONNECTION", "CONNECT"))
 
     # -- accessors -------------------------------------------------------
 

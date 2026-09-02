@@ -9,3 +9,6 @@ __pycache__/
 .DS_Store
 .ipynb_checkpoints/
 CLAUDE.md
+
+# Local sim-mode config, sed from indi.yaml; holds the real site.
+indi-sim.yaml
