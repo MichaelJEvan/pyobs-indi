@@ -198,6 +198,39 @@ def test_a_deliberate_slew_rearms_the_watcher() -> None:
     assert asyncio.run(run()) is False, "a deliberate slew did not re-arm the watcher"
 
 
+def test_reconnect_readopts_target_when_tracking() -> None:
+    """A module restart clears _target (it lives only in memory). If the mount
+    is still tracking on reconnect, the current position must be re-adopted as
+    the target so the flip watcher re-arms -- otherwise a restarted module
+    tracks past the meridian un-flipped (measured on a live AM3N 2026-09-02)."""
+    async def run():
+        t = _scope()
+        t._auto_flip = True
+        t._target = None                       # a restart cleared it
+        t._cached = (185.0, 40.0)              # the mount is tracking here
+        # FakeIndi.switch_on already reports TELESCOPE_TRACK_STATE == TRACK_ON
+        await t._readopt_target_after_reconnect()
+        return t._target
+
+    assert asyncio.run(run()) == (185.0, 40.0), \
+        "tracking on reconnect but the flip target was not re-adopted"
+
+
+def test_reconnect_does_not_adopt_a_target_when_not_tracking() -> None:
+    """Idle or parked on reconnect: nothing is being tracked, so no target is
+    invented (a slew in progress has an unknown destination; parked has none)."""
+    async def run():
+        t = _scope()
+        t._auto_flip = True
+        t._target = None
+        t._cached = (185.0, 40.0)
+        t._indi.switch_on = lambda p: "TRACK_OFF" if p == "TELESCOPE_TRACK_STATE" else None
+        await t._readopt_target_after_reconnect()
+        return t._target
+
+    assert asyncio.run(run()) is None, "adopted a flip target while not tracking"
+
+
 def test_a_refused_tracking_reset_no_longer_raises() -> None:
     """The firmware refuses TRACK_ON past the meridian; the goto that follows
     is the cure, so the refusal must not kill it (it did, twice, 2026-08-31)."""

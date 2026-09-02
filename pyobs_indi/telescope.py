@@ -149,8 +149,10 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         self._flip_disarmed = False
         self._flipping = False        # True only while the watcher's own goto runs
         # Re-send site/time after every reconnect, not just the first
-        # connect: a restarted driver resets to LAT=0/LONG=0.
-        self._indi.on_connected = self._sync_site_and_time
+        # connect: a restarted driver resets to LAT=0/LONG=0. The same hook
+        # re-adopts the tracked target, so a module restart does not disarm
+        # the meridian-flip watcher (see _on_connected).
+        self._indi.on_connected = self._on_connected
         self.add_background_task(self._update_position)
         self.add_background_task(self._meridian_watch)
 
@@ -472,6 +474,40 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         await self._indi.refresh(prop)
         return await self._indi.wait_until(done, UNPARK_TIMEOUT / 2)
 
+
+    async def _on_connected(self) -> None:
+        """Runs on every connect and reconnect (INDI on_connected hook)."""
+        await self._sync_site_and_time()
+        await self._readopt_target_after_reconnect()
+
+    async def _readopt_target_after_reconnect(self) -> None:
+        """Re-arm the meridian-flip watcher after a restart that cleared the target.
+
+        The flip watcher only fires when it knows its target, and _target is
+        held in memory only -- a module restart resets it to None. A module
+        restarted mid-track therefore forgets what it is following and never
+        flips it: the mount tracks past the meridian un-flipped until someone
+        re-commands the target. Measured on a live AM3N 2026-09-02, when
+        restarting the module for a version bump silently disarmed the flip.
+
+        If the mount is tracking but we hold no target, adopt its current
+        position as the target. A tracking mount is locked on its target, so
+        its position IS the target to within tracking drift -- close enough to
+        decide a meridian crossing. Only tracking qualifies: a slew in progress
+        has an unknown destination, and idle/parked has no target to flip.
+        """
+        if self._target is not None or not self._auto_flip:
+            return
+        if self._indi.switch_on("TELESCOPE_TRACK_STATE") != "TRACK_ON":
+            return
+        if self._position_radec is None:
+            await self._publish_position()      # fill _cached from the mount
+        pos = self._position_radec
+        if pos is not None:
+            self._target = pos
+            log.info("indi       tracking on reconnect but no target held; adopted "
+                     "current position %.4f %.4f -- meridian-flip watch armed",
+                     pos[0], pos[1])
 
     async def _sync_site_and_time(self) -> None:
         """Send site coordinates and UTC to the mount.
