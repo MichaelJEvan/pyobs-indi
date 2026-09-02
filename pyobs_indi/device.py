@@ -88,6 +88,11 @@ class IndiDevice:
     # -- connection ------------------------------------------------------
 
     @property
+    def device(self) -> str:
+        """The INDI device name this client is bound to (e.g. 'ZWO AM5')."""
+        return self._device
+
+    @property
     def connected(self) -> bool:
         return self._writer is not None and not self._writer.is_closing()
 

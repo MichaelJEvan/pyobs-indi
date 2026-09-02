@@ -98,6 +98,7 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
                  settle_time: float = 1.0, arrival_tolerance: float = ARRIVAL_TOLERANCE,
                  log_file: str | None = "analysis/indi-log.csv",
                  auto_flip: bool = True,
+                 park_to_pole_on_start: bool = False,
                  **kwargs: Any) -> None:
         """
         Args:
@@ -137,6 +138,11 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         self._tracking_modes = [TrackingMode.SIDEREAL, TrackingMode.SOLAR,
                                 TrackingMode.LUNAR, TrackingMode.OFF]
         self._auto_flip = auto_flip
+        # SIM-ONLY, off by default. The INDI Telescope Simulator cold-boots
+        # parked at RA0/Dec0 (below the horizon); with this set it is sent to
+        # the pole on startup. Triple-guarded so it can never move a real
+        # mount -- see _park_sim_to_pole_if_cold_booted.
+        self._park_to_pole_on_start = park_to_pole_on_start
         self._flip_attempts = 0
         self._no_pier_warned = False
         # A manual stop stands the auto-flip watcher down until the next
@@ -205,6 +211,40 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         await self.comm.set_state(
             ITrackingMode, TrackingModeState(mode=self._tracking_mode_now()))
         await self._change_motion_status(await self._get_status())
+        await self._park_sim_to_pole_if_cold_booted()
+
+    async def _park_sim_to_pole_if_cold_booted(self) -> None:
+        """SIM ONLY: send the simulator to the pole if it cold-booted at 0/0.
+
+        The INDI Telescope Simulator has no way to set its start position and
+        always cold-boots parked at RA0/Dec0, below the horizon. When enabled
+        (indi-sim.yaml only), unpark->park sends it to its pole park position.
+
+        Triple-guarded so this can NEVER move a real mount or a tracking sim:
+          1. opt-in flag, off by default, set ONLY in indi-sim.yaml;
+          2. the device name must be exactly 'Telescope Simulator' -- a real
+             mount ('ZWO AM5') is refused even if the flag somehow reached it;
+          3. it fires only from the cold-boot state (parked AND sitting at
+             ~Dec 0), so a module restart onto a tracking or already-poled sim
+             leaves it untouched.
+        This is transient park/unpark to the *existing* park position -- it
+        writes no mount setting (see the never-change-internal-settings rule).
+        """
+        if not self._park_to_pole_on_start:
+            return
+        if self._indi.device != "Telescope Simulator":
+            log.warning("indi       park_to_pole_on_start ignored: device is %r, "
+                        "not the simulator -- refusing to move it", self._indi.device)
+            return
+        if self._indi.switch_on("TELESCOPE_PARK") != "PARK":
+            return                      # only the cold-boot parked state qualifies
+        pos = self._position_radec
+        if pos is None or abs(pos[1]) > 1.0:
+            return                      # not at the ~Dec 0 cold-boot spot; leave it
+        log.info("indi       sim cold-booted parked at the horizon; unpark->park to the pole")
+        await self._indi.set_switch("TELESCOPE_PARK", "UNPARK")
+        await self._settled_on_switch("TELESCOPE_PARK", "UNPARK")
+        await self._indi.set_switch("TELESCOPE_PARK", "PARK")
 
     async def close(self) -> None:
         await self._indi.close()

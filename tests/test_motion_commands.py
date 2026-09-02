@@ -323,6 +323,69 @@ def test_a_normal_slew_still_reports_arrival() -> None:
     assert asyncio.run(run()) == "arrived"
 
 
+# -- sim-only park-to-pole on startup, and its guards ------------------
+
+def _cold_sim():
+    """A scope whose fake reports the simulator, cold-booted parked at 0/0."""
+    t = _scope()
+    t._park_to_pole_on_start = True
+    t._indi.device = "Telescope Simulator"
+    t._indi.parked = True
+    t._indi.truth_parked = True
+    t._cached = (0.0, 0.0)
+    return t
+
+
+def _park_switches(t) -> list:
+    return [e for e in t._indi.sent if e[0] == "TELESCOPE_PARK"]
+
+
+def test_sim_park_to_pole_fires_from_cold_boot() -> None:
+    """The whole point: a sim cold-booted parked at 0/0 is sent to the pole."""
+    t = _cold_sim()
+    asyncio.run(t._park_sim_to_pole_if_cold_booted())
+    sent = _park_switches(t)
+    assert ("TELESCOPE_PARK", "UNPARK") in sent and ("TELESCOPE_PARK", "PARK") in sent, \
+        f"cold-booted sim was not sent to the pole; sent={sent}"
+
+
+def test_park_to_pole_refuses_a_real_mount() -> None:
+    """Gate 2: the device-name check must refuse a real mount even if the flag
+    somehow reached it. This is the one that must never fail."""
+    t = _cold_sim()
+    t._indi.device = "ZWO AM5"                 # a real mount
+    asyncio.run(t._park_sim_to_pole_if_cold_booted())
+    assert _park_switches(t) == [], "moved a real mount -- the device gate failed"
+
+
+def test_park_to_pole_off_by_default() -> None:
+    """Gate 1: with the flag off, nothing happens even on the sim device."""
+    t = _cold_sim()
+    t._park_to_pole_on_start = False
+    asyncio.run(t._park_sim_to_pole_if_cold_booted())
+    assert _park_switches(t) == [], "fired with the flag off"
+
+
+def test_park_to_pole_leaves_a_tracking_sim() -> None:
+    """Gate 3: a module restart onto a *tracking* sim must not yank it to the
+    pole -- this is the reconnect-mid-track hazard."""
+    t = _cold_sim()
+    t._indi.parked = False
+    t._indi.truth_parked = False
+    t._cached = (12.0, 45.0)                   # tracking somewhere, not parked at 0/0
+    asyncio.run(t._park_sim_to_pole_if_cold_booted())
+    assert _park_switches(t) == [], "yanked a tracking sim to the pole"
+
+
+def test_park_to_pole_leaves_an_already_poled_sim() -> None:
+    """Gate 3b: parked but already at the pole (not the 0/0 cold-boot spot) is
+    left alone, so a restart does not re-park a sim that is already home."""
+    t = _cold_sim()
+    t._cached = (0.0, 90.0)                     # already at the pole
+    asyncio.run(t._park_sim_to_pole_if_cold_booted())
+    assert _park_switches(t) == [], "re-parked a sim that was already at the pole"
+
+
 if __name__ == "__main__":
     tel_mod.POSITION_INTERVAL = 0.01
     tel_mod.UNPARK_TIMEOUT = 1.0
