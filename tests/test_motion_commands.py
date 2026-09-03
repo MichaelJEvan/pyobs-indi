@@ -54,6 +54,7 @@ class FakeIndi:
         self.rev = 0                              # bumps on every driver update
         self.error_count = 0                      # bumps per driver error message
         self.timeout_attr = None                  # driver-declared per-prop timeout
+        self.connection = "CONNECT"               # driver's link to the hardware
 
     # -- what the telescope module reads -------------------------------
     def _advance(self) -> None:
@@ -87,6 +88,8 @@ class FakeIndi:
         return STATE_OK
 
     def switch_on(self, prop: str):
+        if prop == "CONNECTION":
+            return self.connection
         if prop == "TELESCOPE_PARK":
             return "PARK" if self.parked else "UNPARK"
         if prop == "TELESCOPE_TRACK_STATE":
@@ -500,6 +503,31 @@ def test_liveness_erroring_recovers_when_errors_stop() -> None:
     assert stale is False, "did not recover after errors stopped"
     assert status == str(MotionStatus.PARKED), \
         f"after recovery reported {status}, not the real PARKED"
+
+
+def test_disconnected_driver_reports_unknown_not_cached_park() -> None:
+    """A driver reporting CONNECTION=DISCONNECT is not talking to the mount.
+    Cached PARK/TRACK switches may still read valid (an indiserver bounce brings
+    drivers back disconnected, 2026-09-03), so status must be UNKNOWN, not a
+    trusted PARKED."""
+    async def run():
+        t = _scope()
+        t._indi.parked = True                 # cache still says PARKED
+        t._indi.connection = "DISCONNECT"     # ...but the driver is disconnected
+        return str(await t._get_status())
+    assert asyncio.run(run()) == str(MotionStatus.UNKNOWN), \
+        "a disconnected driver was reported as PARKED, not UNKNOWN"
+
+
+def test_connected_driver_still_reports_real_state() -> None:
+    """The guard must not fire on a healthy connected driver."""
+    async def run():
+        t = _scope()
+        t._indi.parked = True
+        t._indi.connection = "CONNECT"
+        return str(await t._get_status())
+    assert asyncio.run(run()) == str(MotionStatus.PARKED), \
+        "a healthy connected+parked mount was not reported as PARKED"
 
 
 # -- auto-reconnect: recover a dead link, capped, never moves the mount --

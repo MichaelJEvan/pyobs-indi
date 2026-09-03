@@ -298,6 +298,16 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
             # valid. Report UNKNOWN so a dead link cannot masquerade as PARKED
             # or TRACKING. Checked first so it overrides every cached state.
             return MotionStatus.UNKNOWN
+        if self._indi.switch_on("CONNECTION") == "DISCONNECT":
+            # The driver is up and its cache may still hold valid-looking PARK/
+            # TRACK switches, but it reports its own link to the hardware is
+            # down -- a manual disconnect, or a driver that dropped the mount.
+            # A disconnected mount is not PARKED or TRACKING, so report UNKNOWN
+            # rather than trust the stale cache. The reader's auto-connect
+            # re-establishes the link; this only keeps the report honest until
+            # it does. (An indiserver bounce brings drivers back DISCONNECTED,
+            # measured 2026-09-03.)
+            return MotionStatus.UNKNOWN
         if not self._indi.connected or self._indi.state("EQUATORIAL_EOD_COORD") is None:
             # Connected but with an empty cache (e.g. right after reconnect)
             # must be UNKNOWN, not IDLE: we have not heard from the mount yet.
