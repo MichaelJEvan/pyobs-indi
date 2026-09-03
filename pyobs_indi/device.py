@@ -245,7 +245,19 @@ class IndiDevice:
             for m in _VECTOR.finditer(buf):
                 self._absorb(m)
                 last = m.end()
-            for msg in re.findall(r'<message[^>]*message="([^"]*)"', buf[:last]):
+            for tag in re.finditer(r'<message\b([^>]*)>', buf[:last]):
+                attrs = dict(re.findall(r'(\w+)="([^"]*)"', tag.group(1)))
+                # Drop messages addressed to another device: several drivers
+                # share one indiserver and it broadcasts every driver's
+                # messages to all clients, so an unfiltered log mixes devices
+                # (a real mount's errors showed up in the sim's log, 2026-09-03).
+                # Keep device-less messages (general server notices).
+                dev = attrs.get("device")
+                if dev and dev != self._device:
+                    continue
+                msg = attrs.get("message")
+                if msg is None:
+                    continue
                 self.messages.append(msg)
                 log.info("indi       %s", msg)
             buf = buf[last:]

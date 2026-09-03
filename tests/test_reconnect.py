@@ -71,6 +71,13 @@ class FakeIndiServer:
             f'<defSwitch name="TRACK_ON">On</defSwitch>'
             f'</defSwitchVector>')
 
+    async def push(self, blob: str) -> None:
+        """Send raw INDI XML to every connected client."""
+        for w in self._writers:
+            w.write(blob.encode())
+            await w.drain()
+        await asyncio.sleep(0.05)
+
     async def hang_up(self) -> None:
         """Drop every client, as killing indiserver would."""
         for w in self._writers:
@@ -268,6 +275,33 @@ def test_a_healthy_link_is_not_killed_by_the_watchdog() -> None:
             await server.stop()
 
     asyncio.run(run())
+
+
+def test_messages_for_other_devices_are_not_logged() -> None:
+    """One indiserver hosts several drivers and broadcasts every driver's
+    messages to all clients. A client bound to one device must log only its
+    own (and device-less server) messages -- not a neighbour's, which is how a
+    real mount's errors ended up in the sim's log (2026-09-03)."""
+    async def run():
+        server, dev = await _rig()
+        try:
+            # messages precede a vector so they fall within buf[:last] and parse
+            await server.push(
+                '<message device="Mount" message="mine"/>'
+                '<message device="Camera" message="theirs"/>'
+                '<message message="server notice"/>'
+                '<defNumberVector device="Mount" name="X" state="Ok">'
+                '<defNumber name="RA">1</defNumber></defNumberVector>')
+            await _settled(lambda: "mine" in dev.messages)
+            return list(dev.messages)
+        finally:
+            await dev.close()
+            await server.stop()
+
+    msgs = asyncio.run(run())
+    assert "mine" in msgs, "own-device message was dropped"
+    assert "server notice" in msgs, "device-less server message was dropped"
+    assert "theirs" not in msgs, "another device's message leaked into the log"
 
 
 if __name__ == "__main__":
