@@ -158,6 +158,8 @@ def _scope(travel_ticks: int = 5) -> IndiTelescope:
     t._eod_rev = -1
     t._stale_polls = 0
     t._errs_at_fresh = 0
+    t._errs_prev = 0
+    t._err_polls = 0
     t._link_stale = False
     t._reconnecting = False
     t._reconnect_attempts = 0
@@ -453,6 +455,50 @@ def test_liveness_recovers_when_updates_resume() -> None:
         return t._link_stale, str(await t._get_status())
     stale, status = asyncio.run(run())
     assert stale is False, "did not recover after updates resumed"
+    assert status == str(MotionStatus.PARKED), \
+        f"after recovery reported {status}, not the real PARKED"
+
+
+def test_liveness_advancing_but_erroring_latches_unknown() -> None:
+    """Mode 2, measured on the AM5 2026-09-03: mount powered off with the USB
+    still attached. The driver keeps re-publishing stale coordinates -- the
+    revision advances every poll, so the frozen-revision test never fires --
+    while flooding serial errors. The error stream alone must latch UNKNOWN over
+    the cached PARKED (what showed the parked-but-dead mount in the GUI)."""
+    async def run():
+        t = _scope()
+        t._indi.parked = True                 # cache still says PARKED
+        for i in range(1, tel_mod.STALE_UPDATE_POLLS + 1):
+            t._indi.rev = i                   # a fresh (stale-valued) publish
+            t._indi.error_count += 1          # ...and a new error each poll
+            t._update_liveness()
+        return t._link_stale, str(await t._get_status())
+    stale, status = asyncio.run(run())
+    assert stale is True, "advancing-but-erroring link did not latch stale"
+    assert status == str(MotionStatus.UNKNOWN), \
+        f"powered-off mount reported {status}, not UNKNOWN"
+
+
+def test_liveness_erroring_recovers_when_errors_stop() -> None:
+    """Mode 2 recovery: the mount is powered back on -- the driver stops erroring
+    while its feed keeps advancing -- so the latch clears and the real state
+    returns."""
+    async def run():
+        t = _scope()
+        t._indi.parked = True
+        for i in range(1, tel_mod.STALE_UPDATE_POLLS + 1):
+            t._indi.rev = i
+            t._indi.error_count += 1
+            t._update_liveness()
+        assert t._link_stale, "setup: should be stale first"
+        # mount back on: feed keeps advancing, no new errors
+        for i in range(tel_mod.STALE_UPDATE_POLLS + 1,
+                       tel_mod.STALE_UPDATE_POLLS * 2 + 1):
+            t._indi.rev = i
+            t._update_liveness()
+        return t._link_stale, str(await t._get_status())
+    stale, status = asyncio.run(run())
+    assert stale is False, "did not recover after errors stopped"
     assert status == str(MotionStatus.PARKED), \
         f"after recovery reported {status}, not the real PARKED"
 

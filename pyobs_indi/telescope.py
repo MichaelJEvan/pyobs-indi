@@ -158,6 +158,8 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         self._eod_rev = -1
         self._stale_polls = 0
         self._errs_at_fresh = 0
+        self._errs_prev = 0
+        self._err_polls = 0
         self._link_stale = False
         # Auto-reconnect: on a detected stale link, try to recover the driver's
         # connection (disconnect->reconnect re-opens the serial). Single-flight,
@@ -328,34 +330,61 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
     def _update_liveness(self) -> None:
         """Track whether the mount has stopped answering.
 
-        A frozen position revision alone is NOT enough: a driver that publishes
-        only on change (the INDI simulator) freezes while perfectly tracking a
-        static target, yet is healthy. So require BOTH a frozen revision AND
-        fresh error messages -- a lost link floods them ("Serial read error",
-        measured on the AM5 2026-09-03) while a healthy static mount stays
-        silent. Then _get_status reports UNKNOWN instead of a stale cached state.
+        Two measured death modes, and neither a frozen revision nor an error
+        burst alone tells them apart from health:
+
+        1. Frozen feed. The link drops and position updates stop. But a driver
+           that publishes only on change (the INDI simulator) also freezes while
+           perfectly tracking a static target, yet is healthy -- so a frozen
+           revision counts as dead only if the driver is ALSO erroring.
+        2. Erroring feed. Mount powered off with USB still attached (AM5,
+           measured 2026-09-03): the driver keeps re-publishing stale
+           coordinates on its timer, so the revision advances every poll and
+           mode 1 never fires -- yet it floods "Serial write error" / "Error
+           reading RA/DEC" the whole time. Detect this on the error stream:
+           new errors every poll for STALE_UPDATE_POLLS in a row.
+
+        A healthy mount (sim or real) brings zero of these errors, and a one-off
+        serial blip cannot sustain the run, so neither test false-fires. When
+        either latches, _get_status reports UNKNOWN instead of a stale state.
         """
         rev = self._indi.revision("EQUATORIAL_EOD_COORD")
         errs = self._indi.error_count
+
+        # Mode 2: count consecutive polls that each brought new errors.
+        if errs > self._errs_prev:
+            self._err_polls += 1
+        else:
+            self._err_polls = 0
+        self._errs_prev = errs
+        erroring = self._err_polls >= STALE_UPDATE_POLLS
+
         if rev != self._eod_rev:
-            # Fresh update: the link is alive. Reset, and note the error count
-            # now so later errors can be told from ones already seen.
+            # Feed is advancing. Note the error count now so a later frozen
+            # stretch can tell new errors from ones already seen.
             self._eod_rev = rev
             self._stale_polls = 0
             self._errs_at_fresh = errs
-            if self._link_stale:
+            # Recovery: link answering AND no longer erroring -> clear.
+            if self._link_stale and not erroring:
                 self._link_stale = False
                 self._reconnect_attempts = 0
                 self._reconnect_gave_up = False
                 log.info("indi       mount is answering again; position updating")
-            return
-        self._stale_polls += 1
-        if (self._stale_polls >= STALE_UPDATE_POLLS and errs > self._errs_at_fresh
-                and not self._link_stale):
+        else:
+            self._stale_polls += 1
+
+        # Mode 1: frozen revision long enough AND fresh errors since it froze.
+        frozen_dead = (self._stale_polls >= STALE_UPDATE_POLLS
+                       and errs > self._errs_at_fresh)
+        if (erroring or frozen_dead) and not self._link_stale:
             self._link_stale = True
-            log.warning("indi       mount stopped answering: no position update in "
-                        "%d polls and the driver is erroring; link may be down, "
-                        "reporting UNKNOWN", self._stale_polls)
+            why = ("driver erroring every poll while position still updates"
+                   if erroring else
+                   "no position update in %d polls and the driver is erroring"
+                   % self._stale_polls)
+            log.warning("indi       mount stopped answering: %s; link may be "
+                        "down, reporting UNKNOWN", why)
 
     async def _update_position(self) -> None:
         """Background task: publish position and motion status once a second."""
