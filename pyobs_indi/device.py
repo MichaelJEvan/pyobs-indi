@@ -79,6 +79,12 @@ class IndiDevice:
         self._props: dict[str, dict[str, Any]] = {}
         self._changed = asyncio.Event()
         self.messages: list[str] = []
+        # Count of error messages this device has emitted. A driver that has
+        # lost contact with its mount floods these ("Serial read error",
+        # "Error reading RA/DEC" -- measured on the AM5, 2026-09-03); the
+        # liveness check uses a rising count to tell a dead link from a mount
+        # that is simply holding a static position.
+        self._error_count = 0
         # Optional async callback, invoked after every successful connect
         # (including reconnects). Used by the telescope layer to re-send site
         # and time: a restarted driver resets to LAT=0/LONG=0 and must be
@@ -91,6 +97,11 @@ class IndiDevice:
     def device(self) -> str:
         """The INDI device name this client is bound to (e.g. 'ZWO AM5')."""
         return self._device
+
+    @property
+    def error_count(self) -> int:
+        """Cumulative count of error messages this driver has emitted."""
+        return self._error_count
 
     @property
     def connected(self) -> bool:
@@ -259,6 +270,8 @@ class IndiDevice:
                 if msg is None:
                     continue
                 self.messages.append(msg)
+                if "error" in msg.lower():
+                    self._error_count += 1
                 log.info("indi       %s", msg)
             buf = buf[last:]
             if last:
