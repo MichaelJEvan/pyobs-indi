@@ -159,6 +159,9 @@ def _scope(travel_ticks: int = 5) -> IndiTelescope:
     t._stale_polls = 0
     t._errs_at_fresh = 0
     t._link_stale = False
+    t._reconnecting = False
+    t._reconnect_attempts = 0
+    t._reconnect_gave_up = False
     return t
 
 
@@ -452,6 +455,63 @@ def test_liveness_recovers_when_updates_resume() -> None:
     assert stale is False, "did not recover after updates resumed"
     assert status == str(MotionStatus.PARKED), \
         f"after recovery reported {status}, not the real PARKED"
+
+
+# -- auto-reconnect: recover a dead link, capped, never moves the mount --
+
+def test_auto_reconnect_tries_then_gives_up_without_moving() -> None:
+    """A link that stays dead: reconnect up to RECONNECT_ATTEMPTS then give up.
+    It only toggles CONNECTION -- it must never command motion."""
+    async def run():
+        tel_mod.RECONNECT_PAUSE = 0.001
+        tel_mod.RECONNECT_SETTLE = 0.001
+        t = _scope()
+        t._link_stale = True              # dead; the fake never recovers
+        await t._auto_reconnect()
+        return t
+    t = asyncio.run(run())
+    switches = [e for e in t._indi.sent if e[0] == "CONNECTION"]
+    assert ("CONNECTION", "DISCONNECT") in switches, "never disconnected"
+    assert switches.count(("CONNECTION", "CONNECT")) == tel_mod.RECONNECT_ATTEMPTS, \
+        f"expected {tel_mod.RECONNECT_ATTEMPTS} reconnect tries, got {switches}"
+    assert t._reconnect_gave_up is True, "did not give up after the cap"
+    assert not any(p == "TELESCOPE_PARK" for p, _ in t._indi.sent), "parked the mount"
+    assert "EQUATORIAL_EOD_COORD" not in t._indi.numbers_sent, "slewed the mount"
+
+
+def test_auto_reconnect_stops_when_link_recovers() -> None:
+    """If the driver answers again after a reconnect, stop early and don't give up."""
+    async def run():
+        tel_mod.RECONNECT_PAUSE = 0.001
+        tel_mod.RECONNECT_SETTLE = 0.001
+        t = _scope()
+        t._link_stale = True
+        real = t._indi.set_switch
+        async def recover_on_connect(prop, el):
+            await real(prop, el)
+            if prop == "CONNECTION" and el == "CONNECT":
+                t._link_stale = False        # driver answering again
+        t._indi.set_switch = recover_on_connect
+        await t._auto_reconnect()
+        return t
+    t = asyncio.run(run())
+    assert t._reconnect_attempts == 1, "kept retrying after recovery"
+    assert t._reconnect_gave_up is False, "gave up despite recovering"
+
+
+def test_recovery_resets_reconnect_state() -> None:
+    """When updates resume, the stale latch clears and the reconnect counters
+    reset so the next outage gets a fresh set of attempts."""
+    t = _scope()
+    t._link_stale = True
+    t._reconnect_gave_up = True
+    t._reconnect_attempts = tel_mod.RECONNECT_ATTEMPTS
+    t._eod_rev = 5
+    t._indi.rev = 99                         # a fresh publish
+    t._update_liveness()
+    assert t._link_stale is False, "did not clear stale on recovery"
+    assert t._reconnect_attempts == 0, "did not reset attempt count"
+    assert t._reconnect_gave_up is False, "did not clear give-up on recovery"
 
 
 if __name__ == "__main__":

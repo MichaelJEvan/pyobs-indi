@@ -50,6 +50,12 @@ STALE_UPDATE_POLLS = 5      # consecutive position polls with a frozen revision
                             # only on change and freezes while healthily holding
                             # a static target, so the driver's error flood is
                             # what tells a dead link apart. 5 clears timing skew.
+RECONNECT_ATTEMPTS = 3      # auto-reconnect tries after a stale link is
+                            # detected, before escalating to manual help
+RECONNECT_PAUSE = 3.0       # seconds between the DISCONNECT and the CONNECT
+RECONNECT_SETTLE = 20.0     # wait after CONNECT for the link to re-establish;
+                            # the AM5's handshake took ~16 s (2026-08-31), so
+                            # give it room before counting the attempt failed
 MOVE_TIMEOUT = 300.0        # max wait for a park to finish moving
 UNPARK_TIMEOUT = 30.0       # max wait for the park switch to change
 RESPONSE_TIMEOUT = 60.0     # fallback wait for the driver's reply to a slew
@@ -153,6 +159,12 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         self._stale_polls = 0
         self._errs_at_fresh = 0
         self._link_stale = False
+        # Auto-reconnect: on a detected stale link, try to recover the driver's
+        # connection (disconnect->reconnect re-opens the serial). Single-flight,
+        # capped, and it gives up rather than hammering a link that stays dead.
+        self._reconnecting = False
+        self._reconnect_attempts = 0
+        self._reconnect_gave_up = False
         self._auto_flip = auto_flip
         # SIM-ONLY, off by default. The INDI Telescope Simulator cold-boots
         # parked at RA0/Dec0 (below the horizon); with this set it is sent to
@@ -333,6 +345,8 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
             self._errs_at_fresh = errs
             if self._link_stale:
                 self._link_stale = False
+                self._reconnect_attempts = 0
+                self._reconnect_gave_up = False
                 log.info("indi       mount is answering again; position updating")
             return
         self._stale_polls += 1
@@ -348,10 +362,46 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         while True:
             await self._publish_position()
             self._update_liveness()
+            if (self._link_stale and not self._reconnecting
+                    and not self._reconnect_gave_up):
+                asyncio.create_task(self._auto_reconnect())
             status = await self._get_status()
             if status != self.motion_status():
                 await self._change_motion_status(status)
             await asyncio.sleep(POSITION_INTERVAL)
+
+    async def _auto_reconnect(self) -> None:
+        """Recover a stale link by reconnecting the driver.
+
+        DISCONNECT then CONNECT re-opens the serial and re-handshakes -- what
+        recovered the AM3 by hand 2026-09-03. Recovers a wedged session; a link
+        truly gone (USB removed, mount powered off) will not come back this way,
+        so it is capped at RECONNECT_ATTEMPTS and then escalates rather than
+        hammering. It only re-establishes comms and reads state -- it never
+        commands motion, so the mount is not moved. _update_liveness clears
+        _link_stale (and resets these counters) once updates resume.
+        """
+        if self._reconnecting:
+            return
+        self._reconnecting = True
+        try:
+            while (self._link_stale
+                   and self._reconnect_attempts < RECONNECT_ATTEMPTS):
+                self._reconnect_attempts += 1
+                log.warning("indi       auto-reconnect attempt %d/%d",
+                            self._reconnect_attempts, RECONNECT_ATTEMPTS)
+                with contextlib.suppress(Exception):
+                    await self._indi.set_switch("CONNECTION", "DISCONNECT")
+                    await asyncio.sleep(RECONNECT_PAUSE)
+                    await self._indi.set_switch("CONNECTION", "CONNECT")
+                await asyncio.sleep(RECONNECT_SETTLE)
+            if self._link_stale and not self._reconnect_gave_up:
+                self._reconnect_gave_up = True
+                log.error("indi       auto-reconnect failed after %d attempts; "
+                          "link still down -- needs manual help (power / USB / "
+                          "cabling). Staying UNKNOWN.", RECONNECT_ATTEMPTS)
+        finally:
+            self._reconnecting = False
 
     def _seconds_past_meridian(self) -> float | None:
         """Seconds since the tracked target crossed the meridian; negative before.
