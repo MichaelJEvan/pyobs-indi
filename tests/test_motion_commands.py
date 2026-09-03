@@ -154,6 +154,9 @@ def _scope(travel_ticks: int = 5) -> IndiTelescope:
     t._flip_disarmed = False
     t._flipping = False
     t._status = None
+    t._eod_rev = -1
+    t._stale_polls = 0
+    t._link_stale = False
     return t
 
 
@@ -384,6 +387,53 @@ def test_park_to_pole_leaves_an_already_poled_sim() -> None:
     t._cached = (0.0, 90.0)                     # already at the pole
     asyncio.run(t._park_sim_to_pole_if_cold_booted())
     assert _park_switches(t) == [], "re-parked a sim that was already at the pole"
+
+
+# -- link liveness: a frozen driver must not read as healthy ----------
+
+def test_liveness_healthy_link_is_never_stale() -> None:
+    """A driver that keeps re-publishing (revision advancing every poll, as a
+    real one does even at rest) is never flagged stale."""
+    t = _scope()
+    for i in range(1, tel_mod.STALE_UPDATE_POLLS * 2):
+        t._indi.rev = i               # a fresh publish each poll
+        t._update_liveness()
+    assert t._link_stale is False, "healthy link (advancing revision) flagged stale"
+
+
+def test_liveness_frozen_revision_overrides_cached_park() -> None:
+    """A frozen revision (mount stopped answering) must report UNKNOWN even
+    though the cached PARK switch still says PARKED -- the overnight bug."""
+    async def run():
+        t = _scope()
+        t._indi.parked = True             # cached PARK still says parked
+        t._indi.rev = 7; t._eod_rev = 7   # was healthy at rev 7, now frozen
+        for _ in range(tel_mod.STALE_UPDATE_POLLS):
+            t._update_liveness()
+        return t._link_stale, str(await t._get_status())
+    stale, status = asyncio.run(run())
+    assert stale is True, "frozen revision did not latch stale"
+    assert status == str(MotionStatus.UNKNOWN), \
+        f"stale link reported {status}, not UNKNOWN (false-healthy PARKED)"
+
+
+def test_liveness_recovers_when_updates_resume() -> None:
+    """Once the driver publishes again, the stale latch clears and the real
+    state returns."""
+    async def run():
+        t = _scope()
+        t._indi.parked = True
+        t._indi.rev = 7; t._eod_rev = 7   # was healthy at rev 7, now frozen
+        for _ in range(tel_mod.STALE_UPDATE_POLLS):
+            t._update_liveness()
+        assert t._link_stale, "setup: should be stale first"
+        t._indi.rev = 8                    # a fresh publish
+        t._update_liveness()
+        return t._link_stale, str(await t._get_status())
+    stale, status = asyncio.run(run())
+    assert stale is False, "did not recover after updates resumed"
+    assert status == str(MotionStatus.PARKED), \
+        f"after recovery reported {status}, not the real PARKED"
 
 
 if __name__ == "__main__":

@@ -43,6 +43,16 @@ from .device import STATE_ALERT, STATE_BUSY, IndiDevice, IndiError
 log = logging.getLogger(__name__)
 
 POSITION_INTERVAL = 1.0     # matches typical INDI driver publish rate
+STALE_UPDATE_POLLS = 5      # consecutive position polls with no new driver
+                            # update before the link is treated as dead. The
+                            # driver re-publishes EQUATORIAL_EOD_COORD every
+                            # POLLING_PERIOD (measured 1000 ms) even when parked
+                            # or idle -- verified 2026-09-03 the RA advances
+                            # every read at rest -- so a healthy mount always
+                            # bumps the revision; a frozen revision means the
+                            # mount has stopped answering (e.g. serial timeouts)
+                            # while the cached values and switches still look
+                            # valid. 5 clears normal poll/publish timing skew.
 MOVE_TIMEOUT = 300.0        # max wait for a park to finish moving
 UNPARK_TIMEOUT = 30.0       # max wait for the park switch to change
 RESPONSE_TIMEOUT = 60.0     # fallback wait for the driver's reply to a slew
@@ -137,6 +147,14 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         # to make it hold still.
         self._tracking_modes = [TrackingMode.SIDEREAL, TrackingMode.SOLAR,
                                 TrackingMode.LUNAR, TrackingMode.OFF]
+        # Liveness: a dead serial link leaves the cached position and switches
+        # looking valid (numbers()/switch_on() read from cache), so a parked
+        # mount whose link died kept reporting PARKED all night while
+        # unreachable (2026-09-03). Track the driver's update revision instead:
+        # if it stops advancing, the mount has stopped answering.
+        self._eod_rev = -1
+        self._stale_polls = 0
+        self._link_stale = False
         self._auto_flip = auto_flip
         # SIM-ONLY, off by default. The INDI Telescope Simulator cold-boots
         # parked at RA0/Dec0 (below the horizon); with this set it is sent to
@@ -256,6 +274,12 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         Vector state: Idle before a slew, Busy during, Ok after. Park is a
         separate switch and takes precedence over the vector.
         """
+        if self._link_stale:
+            # The driver has stopped updating the position: the mount is not
+            # answering, even though cached switches (e.g. PARK) still read
+            # valid. Report UNKNOWN so a dead link cannot masquerade as PARKED
+            # or TRACKING. Checked first so it overrides every cached state.
+            return MotionStatus.UNKNOWN
         if not self._indi.connected or self._indi.state("EQUATORIAL_EOD_COORD") is None:
             # Connected but with an empty cache (e.g. right after reconnect)
             # must be UNKNOWN, not IDLE: we have not heard from the mount yet.
@@ -291,10 +315,34 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
             self._cached = None
         return False
 
+    def _update_liveness(self) -> None:
+        """Track whether the driver is still updating the position.
+
+        The driver re-publishes EQUATORIAL_EOD_COORD every poll on a healthy
+        link (bumping its revision) even at rest. A revision that stops moving
+        for STALE_UPDATE_POLLS means the mount has stopped answering while the
+        cached values still look valid -- latch that so _get_status reports it.
+        """
+        rev = self._indi.revision("EQUATORIAL_EOD_COORD")
+        if rev != self._eod_rev:
+            self._eod_rev = rev
+            self._stale_polls = 0
+            if self._link_stale:
+                self._link_stale = False
+                log.info("indi       mount is answering again; position updating")
+            return
+        self._stale_polls += 1
+        if self._stale_polls >= STALE_UPDATE_POLLS and not self._link_stale:
+            self._link_stale = True
+            log.warning("indi       mount stopped answering: no position update in "
+                        "%d polls; link may be down, reporting UNKNOWN",
+                        self._stale_polls)
+
     async def _update_position(self) -> None:
         """Background task: publish position and motion status once a second."""
         while True:
             await self._publish_position()
+            self._update_liveness()
             status = await self._get_status()
             if status != self.motion_status():
                 await self._change_motion_status(status)
