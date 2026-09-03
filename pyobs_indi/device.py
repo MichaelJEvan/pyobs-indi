@@ -183,7 +183,15 @@ class IndiDevice:
                     await self._connect()
                     log.info("indi       reconnected to %r; re-asked for every property",
                              self._device)
-                    await self._announce_connected()
+                    # Run the hook concurrently, NOT inline. on_connected can block
+                    # (the telescope layer's site re-send waits for GEOGRAPHIC_COORD),
+                    # and that property only appears after the auto-connect that fires
+                    # in _pump -- which cannot run until this returns. Awaiting here
+                    # stalled reconnect for the hook's whole timeout: an indiserver
+                    # bounce left the mount dead until the wait expired (measured
+                    # 2026-09-03, confirmed against a fake driver). open() already runs
+                    # the reader and the hook concurrently; match that here.
+                    asyncio.create_task(self._announce_connected())
                 except (OSError, asyncio.TimeoutError) as err:
                     # Each attempt may itself burn CONNECT_TIMEOUT, so these
                     # lines appear every CONNECT_TIMEOUT + RECONNECT_DELAY

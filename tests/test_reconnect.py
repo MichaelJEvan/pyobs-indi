@@ -243,6 +243,36 @@ def test_the_connect_hook_fires_on_reconnect() -> None:
     assert asyncio.run(run()) >= 1
 
 
+def test_a_blocking_hook_does_not_stall_reconnect() -> None:
+    """The on_connected hook runs concurrently, not in the reader's path.
+
+    The telescope layer's hook blocks waiting for a property (site re-send waits
+    for GEOGRAPHIC_COORD), and that property only arrives once the reader has
+    connected the driver. Awaiting the hook inline on reconnect deadlocked the
+    two against each other: the reader stalled for the hook's whole timeout and
+    an indiserver bounce left the mount dead for ~600 s (measured 2026-09-03).
+    Here a hook that waits on a property the server never sends must NOT stop
+    the reader from repopulating the cache."""
+    async def run() -> None:
+        server, dev = await _rig()
+        async def slow_hook() -> None:
+            # never satisfied: only a running reader could deliver it
+            await dev.wait_until(lambda: dev.state("NEVER_SENT") is not None, 5.0)
+        dev.on_connected = slow_hook
+        try:
+            server.ra = 9.0                     # so a fresh read is distinguishable
+            await server.hang_up()
+            # the hook blocks for 5 s; the cache must refill well before then
+            assert await _settled(
+                lambda: (dev.numbers("EQUATORIAL_EOD_COORD") or {}).get("RA") == 9.0,
+                timeout=2.5), "the reader stalled behind the on_connected hook"
+        finally:
+            await dev.close()
+            await server.stop()
+
+    asyncio.run(run())
+
+
 def test_a_vanished_peer_is_noticed() -> None:
     """The failure a polite close never exercises. Measured 2026-08-30: the OrbStack VM running indiserver was shut down and the Mac's socket stayed ESTABLISHED, because a machine that disappears sends no FIN and no reset."""
     async def run() -> None:
