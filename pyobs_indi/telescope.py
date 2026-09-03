@@ -56,6 +56,12 @@ RECONNECT_PAUSE = 3.0       # seconds between the DISCONNECT and the CONNECT
 RECONNECT_SETTLE = 20.0     # wait after CONNECT for the link to re-establish;
                             # the AM5's handshake took ~16 s (2026-08-31), so
                             # give it room before counting the attempt failed
+RECONNECT_SLOW = 60.0       # after the fast burst, keep retrying at this slower
+                            # cadence forever instead of giving up: a device that
+                            # returns (kernel recreates the node on the Linux box,
+                            # or the USB is re-attached) then self-heals with no
+                            # manual bump. Measured 2026-09-03: a permanent give-up
+                            # left the mount LINK DOWN after power came back.
 MOVE_TIMEOUT = 300.0        # max wait for a park to finish moving
 UNPARK_TIMEOUT = 30.0       # max wait for the park switch to change
 RESPONSE_TIMEOUT = 60.0     # fallback wait for the driver's reply to a slew
@@ -162,11 +168,11 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         self._err_polls = 0
         self._link_stale = False
         # Auto-reconnect: on a detected stale link, try to recover the driver's
-        # connection (disconnect->reconnect re-opens the serial). Single-flight,
-        # capped, and it gives up rather than hammering a link that stays dead.
+        # connection (disconnect->reconnect re-opens the serial). Single-flight;
+        # a fast burst, then a slow retry that never gives up so the link
+        # self-heals whenever the device returns.
         self._reconnecting = False
         self._reconnect_attempts = 0
-        self._reconnect_gave_up = False
         self._auto_flip = auto_flip
         # SIM-ONLY, off by default. The INDI Telescope Simulator cold-boots
         # parked at RA0/Dec0 (below the horizon); with this set it is sent to
@@ -369,7 +375,6 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
             if self._link_stale and not erroring:
                 self._link_stale = False
                 self._reconnect_attempts = 0
-                self._reconnect_gave_up = False
                 log.info("indi       mount is answering again; position updating")
         else:
             self._stale_polls += 1
@@ -391,8 +396,7 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         while True:
             await self._publish_position()
             self._update_liveness()
-            if (self._link_stale and not self._reconnecting
-                    and not self._reconnect_gave_up):
+            if self._link_stale and not self._reconnecting:
                 asyncio.create_task(self._auto_reconnect())
             status = await self._get_status()
             if status != self.motion_status():
@@ -400,35 +404,44 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
             await asyncio.sleep(POSITION_INTERVAL)
 
     async def _auto_reconnect(self) -> None:
-        """Recover a stale link by reconnecting the driver.
+        """Recover a stale link by reconnecting the driver, and keep trying.
 
         DISCONNECT then CONNECT re-opens the serial and re-handshakes -- what
-        recovered the AM3 by hand 2026-09-03. Recovers a wedged session; a link
-        truly gone (USB removed, mount powered off) will not come back this way,
-        so it is capped at RECONNECT_ATTEMPTS and then escalates rather than
-        hammering. It only re-establishes comms and reads state -- it never
-        commands motion, so the mount is not moved. _update_liveness clears
-        _link_stale (and resets these counters) once updates resume.
+        recovered the AM3 by hand 2026-09-03. A fast burst of RECONNECT_ATTEMPTS
+        handles a merely wedged session; if the link is truly gone (USB removed,
+        mount powered off) it then drops to a slow retry every RECONNECT_SLOW and
+        NEVER gives up, so the moment the device returns -- the kernel recreates
+        the node on the Linux box, or the USB is re-attached -- the next CONNECT
+        succeeds and the link self-heals with no manual bump. (A permanent
+        give-up left the mount LINK DOWN after power came back, 2026-09-03.)
+
+        Single-flight: the one task lives for the whole outage, so _update_position
+        never spawns a second. It only re-establishes comms and reads state -- it
+        never commands motion, so the mount is not moved. _update_liveness clears
+        _link_stale (and resets the attempt count) once clean updates resume,
+        which ends this loop.
         """
         if self._reconnecting:
             return
         self._reconnecting = True
         try:
-            while (self._link_stale
-                   and self._reconnect_attempts < RECONNECT_ATTEMPTS):
+            while self._link_stale:
                 self._reconnect_attempts += 1
-                log.warning("indi       auto-reconnect attempt %d/%d",
-                            self._reconnect_attempts, RECONNECT_ATTEMPTS)
+                n = self._reconnect_attempts
+                fast = n <= RECONNECT_ATTEMPTS
+                if fast:
+                    log.warning("indi       auto-reconnect attempt %d/%d",
+                                n, RECONNECT_ATTEMPTS)
+                elif n == RECONNECT_ATTEMPTS + 1:
+                    log.error("indi       auto-reconnect still down after %d "
+                              "tries; retrying every %.0fs until the device "
+                              "returns (needs power / USB / cabling). Staying "
+                              "UNKNOWN.", RECONNECT_ATTEMPTS, RECONNECT_SLOW)
                 with contextlib.suppress(Exception):
                     await self._indi.set_switch("CONNECTION", "DISCONNECT")
                     await asyncio.sleep(RECONNECT_PAUSE)
                     await self._indi.set_switch("CONNECTION", "CONNECT")
-                await asyncio.sleep(RECONNECT_SETTLE)
-            if self._link_stale and not self._reconnect_gave_up:
-                self._reconnect_gave_up = True
-                log.error("indi       auto-reconnect failed after %d attempts; "
-                          "link still down -- needs manual help (power / USB / "
-                          "cabling). Staying UNKNOWN.", RECONNECT_ATTEMPTS)
+                await asyncio.sleep(RECONNECT_SETTLE if fast else RECONNECT_SLOW)
         finally:
             self._reconnecting = False
 
