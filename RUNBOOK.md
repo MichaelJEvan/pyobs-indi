@@ -45,6 +45,17 @@ Boots the `indi` VM if it is asleep. Window stays busy; leave it running.
 orb -m indi indiserver -v indi_lx200am5
 ```
 
+### 3b. USB watcher (optional but recommended)
+
+Re-attaches the mount's USB to the VM automatically after a mount
+power-cycle, so a mid-session power blip needs no hands at all. Window
+stays busy; leave it running. Safe to leave up: a healthy link is never
+touched.
+
+```
+cd ~/Development/Pyobs/pyobs-indi && ./tools/orb_usb_watch.sh
+```
+
 ### 4. This module
 
 Window stays busy; leave it running.
@@ -107,3 +118,52 @@ orb usb detach 02100000
 
 Software dying never stops the mount; it keeps doing whatever it was last
 told. Park before you walk away.
+
+## Total shutdown
+
+Everything to zero, including programs running detached with no terminal
+(a bridge whose window was closed survives and Ctrl-C can never reach it).
+In order:
+
+1. Mount: park, then power it off. Always first -- software never stops
+   the mount.
+
+2. Ctrl-C every open terminal: the module, the USB watcher, scope/console.
+
+3. Kill the detached bridges (all of them, whatever configs they were
+   started with):
+
+```
+pkill -f "python bridge.py"
+```
+
+4. NorthStar, if it is running detached:
+
+```
+pkill -f northstar.py
+```
+
+5. indiserver in the VM:
+
+```
+orb -m indi pkill indiserver
+```
+
+6. The containers (ejabberd + sim):
+
+```
+cd ~/Development/Pyobs/sim-2.0 && docker compose down
+```
+
+7. OrbStack itself. This also stops the Forgejo container safely -- its
+   data lives in a volume and comes back on the next start:
+
+```
+orb stop
+```
+
+Verify everything is gone; empty output means clean:
+
+```
+ps ax | grep -E "bridge.py|northstar|pyobs indi" | grep -v grep
+```
