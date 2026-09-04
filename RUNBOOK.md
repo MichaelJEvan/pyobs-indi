@@ -143,6 +143,14 @@ pkill -f "python bridge.py"
 pkill -f northstar.py
 ```
 
+4b. Any detached pyobs-indi module -- catches both the real-mount and
+simulator configs (a sim module from an afternoon of testing survived a
+closed window by 8 hours, found only by the verify grep):
+
+```
+pkill -f "pyobs indi"
+```
+
 5. indiserver in the VM:
 
 ```
