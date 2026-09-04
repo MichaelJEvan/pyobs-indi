@@ -166,6 +166,7 @@ def _scope(travel_ticks: int = 5) -> IndiTelescope:
     t._link_stale = False
     t._reconnecting = False
     t._reconnect_attempts = 0
+    t._disconnected_polls = 0
     return t
 
 
@@ -582,6 +583,62 @@ def test_auto_reconnect_stops_when_link_recovers() -> None:
         return t
     t = asyncio.run(run())
     assert t._reconnect_attempts == 1, "kept retrying after recovery"
+
+
+def test_sustained_disconnect_triggers_the_reconnect_loop() -> None:
+    """A driver sitting DISCONNECTED (its one def-time connect failed because
+    the serial node was gone at startup) must be picked up by the paced
+    reconnect loop. The device layer no longer retries per update -- that was
+    the 2026-09-03 connect storm -- so this trigger is what connects a mount
+    powered on after the module started."""
+    async def run():
+        tel_mod.POSITION_INTERVAL = 0.005
+        tel_mod.RECONNECT_PAUSE = 0.001
+        tel_mod.RECONNECT_SETTLE = 0.001
+        tel_mod.RECONNECT_SLOW = 0.001
+        t = _scope()
+        t._indi.connection = "DISCONNECT"
+        async def no_publish(): return False
+        t._publish_position = no_publish
+        t.motion_status = lambda: None
+        t._get_status = lambda: asyncio.sleep(0, result=None)
+        task = asyncio.create_task(t._update_position())
+        tried = False
+        for _ in range(400):
+            await asyncio.sleep(0.005)
+            if ("CONNECTION", "CONNECT") in t._indi.sent:
+                tried = True
+                break
+        t._indi.connection = "CONNECT"        # the mount is back; loops wind down
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return tried
+    assert asyncio.run(run()), "a DISCONNECTED driver was never retried"
+
+
+def test_a_healthy_connected_driver_is_not_reconnect_poked() -> None:
+    """The other half: no CONNECTION commands while the driver reports CONNECT
+    and nothing is stale -- the trigger must not fire on a working link."""
+    async def run():
+        tel_mod.POSITION_INTERVAL = 0.002
+        t = _scope()
+        async def no_publish(): return False
+        t._publish_position = no_publish
+        t.motion_status = lambda: None
+        t._get_status = lambda: asyncio.sleep(0, result=None)
+        task = asyncio.create_task(t._update_position())
+        await asyncio.sleep(0.002 * tel_mod.STALE_UPDATE_POLLS * 4)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return [e for e in t._indi.sent if e[0] == "CONNECTION"]
+    assert asyncio.run(run()) == [], "poked CONNECTION on a healthy link"
 
 
 def test_recovery_resets_reconnect_state() -> None:

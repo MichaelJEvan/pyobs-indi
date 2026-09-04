@@ -45,7 +45,7 @@ SILENCE_TIMEOUT = 6.0       # declare the link dead after this much silence
 STATE_IDLE, STATE_BUSY, STATE_OK, STATE_ALERT = "Idle", "Busy", "Ok", "Alert"
 
 _VECTOR = re.compile(
-    r'<(?:def|set)(\w+?)Vector\s+([^>]*?)>(.*?)</(?:def|set)\1Vector>', re.S)
+    r'<(def|set)(\w+?)Vector\s+([^>]*?)>(.*?)</(?:def|set)\2Vector>', re.S)
 _ATTR = re.compile(r'(\w+)="([^"]*)"')
 # Match both defXXX and oneXXX children: definitions carry the initial value,
 # updates carry the rest.
@@ -85,11 +85,17 @@ class IndiDevice:
         # liveness check uses a rising count to tell a dead link from a mount
         # that is simply holding a static position.
         self._error_count = 0
-        # Optional async callback, invoked after every successful connect
-        # (including reconnects). Used by the telescope layer to re-send site
-        # and time: a restarted driver resets to LAT=0/LONG=0 and must be
-        # reconfigured each time the link comes back.
+        # Optional async callback, invoked when the mount is (back) in
+        # contact: after the first socket connect, and whenever the driver's
+        # CONNECTION switch turns On (see _absorb). Used by the telescope
+        # layer to re-send site and time: a restarted driver resets to
+        # LAT=0/LONG=0 and a power-cycled ZWO to the year 2000, and must be
+        # reconfigured each time the link comes back. The CONNECTION edge is
+        # the trigger that matters -- a serial-only recovery (mount power
+        # cycle, 2026-09-03) never touches the socket, and a hook tied to
+        # socket connects missed it, leaving the mount's clock at Jan 2000.
         self.on_connected: Any = None
+        self._announcing = False
 
     # -- connection ------------------------------------------------------
 
@@ -142,12 +148,21 @@ class IndiDevice:
     async def _announce_connected(self) -> None:
         if self.on_connected is None:
             return
+        if self._announcing:
+            # Overlapping fires coalesce: at startup the open() announce is
+            # usually still waiting for the driver's handshake when the
+            # CONNECTION-On edge lands, and that one running hook reads
+            # current state and completes the same sync a second run would.
+            return
+        self._announcing = True
         try:
             await self.on_connected()
         except Exception as err:
             # A failing hook must not take down the read loop.
             log.warning("indi       on_connected hook failed: %s: %s",
                         type(err).__name__, err)
+        finally:
+            self._announcing = False
 
     async def _connect(self) -> None:
         """Single connect attempt: open socket, request properties, connect driver.
@@ -183,15 +198,15 @@ class IndiDevice:
                     await self._connect()
                     log.info("indi       reconnected to %r; re-asked for every property",
                              self._device)
-                    # Run the hook concurrently, NOT inline. on_connected can block
-                    # (the telescope layer's site re-send waits for GEOGRAPHIC_COORD),
-                    # and that property only appears after the auto-connect that fires
-                    # in _pump -- which cannot run until this returns. Awaiting here
-                    # stalled reconnect for the hook's whole timeout: an indiserver
-                    # bounce left the mount dead until the wait expired (measured
-                    # 2026-09-03, confirmed against a fake driver). open() already runs
-                    # the reader and the hook concurrently; match that here.
-                    asyncio.create_task(self._announce_connected())
+                    # No hook here. It fires from _absorb when the driver's
+                    # CONNECTION switch reads On again -- the cache was just
+                    # cleared, so the re-asked definitions produce that edge
+                    # whether the driver stayed connected or reconnects. A
+                    # socket-level fire was both redundant with the edge and
+                    # blind to serial-only recoveries (mount power cycle with
+                    # the socket healthy throughout, 2026-09-03). An earlier
+                    # inline await here also deadlocked against _pump for the
+                    # hook's whole timeout (measured 2026-09-03).
                 except (OSError, asyncio.TimeoutError) as err:
                     # Each attempt may itself burn CONNECT_TIMEOUT, so these
                     # lines appear every CONNECT_TIMEOUT + RECONNECT_DELAY
@@ -286,7 +301,8 @@ class IndiDevice:
                 self._changed.set()
 
     def _absorb(self, match: re.Match[str]) -> None:
-        attrs = dict(_ATTR.findall(match.group(2)))
+        defined = match.group(1) == "def"
+        attrs = dict(_ATTR.findall(match.group(3)))
         if attrs.get("device") != self._device:
             return
         name = attrs.get("name")
@@ -306,17 +322,34 @@ class IndiDevice:
                 entry["timeout"] = float(attrs["timeout"]) or None
             except ValueError:
                 pass
-        for element, value in _ONE.findall(match.group(3)):
+        prev_connect = entry["values"].get("CONNECT") if name == "CONNECTION" else None
+        for element, value in _ONE.findall(match.group(4)):
             entry["values"][element] = value
-        # Connect the device the moment the driver defines CONNECTION.
-        # Setting it from _connect() raced the definition: on a freshly
-        # started driver the switch arrived first and was dropped with
-        # "dispatch error: Property CONNECTION is not defined" (Telescope
-        # Simulator, 2026-09-01). This runs on the reader task, so the
-        # send goes out as a task rather than blocking the loop.
-        if name == "CONNECTION" and entry["values"].get("CONNECT") != "On":
+        if name != "CONNECTION":
+            return
+        connect = entry["values"].get("CONNECT")
+        # Connect the device the moment the driver DEFINES CONNECTION --
+        # def only, never on set updates. Setting it from _connect() raced
+        # the definition ("dispatch error: Property CONNECTION is not
+        # defined", Telescope Simulator, 2026-09-01). Reacting to every
+        # update was worse: with the serial port gone, each failed CONNECT
+        # publishes CONNECTION Off plus an error message, and answering
+        # each with another CONNECT looped at same-millisecond speed --
+        # the log storm measured on the AM3N power-cycle, 2026-09-03.
+        # If this one attempt fails, the telescope layer's paced
+        # _auto_reconnect owns the retries. Runs on the reader task, so
+        # the send goes out as a task rather than blocking the loop.
+        if defined and connect != "On":
             asyncio.get_running_loop().create_task(
                 self.set_switch("CONNECTION", "CONNECT"))
+        # The mount is (back) in contact when CONNECT turns On -- first
+        # definition or an Off->On recovery, including a serial-only one
+        # where the socket never blipped (mount power cycle, 2026-09-03:
+        # the socket-level hook missed it and the mount kept its cold-boot
+        # Jan-2000 clock). CONNECTION semantics per the INDI standard
+        # properties: CONNECT=On means the driver holds the device link.
+        if connect == "On" and prev_connect != "On":
+            asyncio.get_running_loop().create_task(self._announce_connected())
 
     # -- accessors -------------------------------------------------------
 

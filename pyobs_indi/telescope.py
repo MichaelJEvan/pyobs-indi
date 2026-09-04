@@ -173,6 +173,13 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         # self-heals whenever the device returns.
         self._reconnecting = False
         self._reconnect_attempts = 0
+        # Consecutive position polls with the driver reporting DISCONNECT.
+        # The device layer connects a driver exactly once, when CONNECTION is
+        # defined (retrying on every update was the 2026-09-03 connect storm);
+        # if that one attempt fails -- the port was gone at startup -- someone
+        # must retry, and that someone is _auto_reconnect, triggered once the
+        # DISCONNECT has held for STALE_UPDATE_POLLS.
+        self._disconnected_polls = 0
         self._auto_flip = auto_flip
         # SIM-ONLY, off by default. The INDI Telescope Simulator cold-boots
         # parked at RA0/Dec0 (below the horizon); with this set it is sent to
@@ -303,10 +310,10 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
             # TRACK switches, but it reports its own link to the hardware is
             # down -- a manual disconnect, or a driver that dropped the mount.
             # A disconnected mount is not PARKED or TRACKING, so report UNKNOWN
-            # rather than trust the stale cache. The reader's auto-connect
-            # re-establishes the link; this only keeps the report honest until
-            # it does. (An indiserver bounce brings drivers back DISCONNECTED,
-            # measured 2026-09-03.)
+            # rather than trust the stale cache. A sustained DISCONNECT
+            # triggers _auto_reconnect (see _update_position); this only keeps
+            # the report honest until it succeeds. (An indiserver bounce
+            # brings drivers back DISCONNECTED, measured 2026-09-03.)
             return MotionStatus.UNKNOWN
         if not self._indi.connected or self._indi.state("EQUATORIAL_EOD_COORD") is None:
             # Connected but with an empty cache (e.g. right after reconnect)
@@ -406,7 +413,13 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         while True:
             await self._publish_position()
             self._update_liveness()
-            if self._link_stale and not self._reconnecting:
+            if self._indi.switch_on("CONNECTION") == "DISCONNECT":
+                self._disconnected_polls += 1
+            else:
+                self._disconnected_polls = 0
+            if ((self._link_stale
+                    or self._disconnected_polls >= STALE_UPDATE_POLLS)
+                    and not self._reconnecting):
                 asyncio.create_task(self._auto_reconnect())
             status = await self._get_status()
             if status != self.motion_status():
@@ -425,17 +438,24 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
         succeeds and the link self-heals with no manual bump. (A permanent
         give-up left the mount LINK DOWN after power came back, 2026-09-03.)
 
+        Runs for either trigger: a stale link (_link_stale), or a driver
+        sitting DISCONNECTED after its one def-time connect failed (port gone
+        at startup -- the device layer no longer retries per update, which
+        was the 2026-09-03 connect storm).
+
         Single-flight: the one task lives for the whole outage, so _update_position
         never spawns a second. It only re-establishes comms and reads state -- it
         never commands motion, so the mount is not moved. _update_liveness clears
-        _link_stale (and resets the attempt count) once clean updates resume,
-        which ends this loop.
+        _link_stale (and resets the attempt count) once clean updates resume;
+        a successful CONNECT clears the DISCONNECT condition; either ends
+        this loop.
         """
         if self._reconnecting:
             return
         self._reconnecting = True
         try:
-            while self._link_stale:
+            while (self._link_stale
+                   or self._indi.switch_on("CONNECTION") == "DISCONNECT"):
                 self._reconnect_attempts += 1
                 n = self._reconnect_attempts
                 fast = n <= RECONNECT_ATTEMPTS

@@ -16,6 +16,7 @@
 
 import asyncio
 import pathlib
+import re
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -32,6 +33,9 @@ class FakeIndiServer:
         self.requests = 0               # how many getProperties we answered
         self.silent = False             # stop answering, without ever hanging up
         self.ra = 5.0                   # so a re-read can be told from a stale one
+        self.driver_on = True           # what CONNECTION reports in definitions
+        self.port_ok = True             # False: the serial node is gone; CONNECT fails
+        self.connect_cmds = 0           # newSwitchVector CONNECTION CONNECTs received
         self.port = 0
         self._server: asyncio.AbstractServer | None = None
         self._writers: list[asyncio.StreamWriter] = []
@@ -56,20 +60,62 @@ class FakeIndiServer:
                         # simply ceased to exist; the socket stays
                         # ESTABLISHED on our side with nothing behind it.
                         continue
-                    writer.write(self._definitions().encode())
+                    # A named getProperties (the client's heartbeat probes)
+                    # re-announces that one property, as indiserver does;
+                    # only an unnamed one sends the full table.
+                    m = re.search(rb'name="(\w+)"', data)
+                    writer.write(self._definitions(
+                        m.group(1).decode() if m else None).encode())
+                    await writer.drain()
+                elif b'name="CONNECTION"' in data and b'name="CONNECT"' in data:
+                    self.connect_cmds += 1
+                    if self.silent:
+                        continue
+                    if self.port_ok:
+                        self.driver_on = True
+                        writer.write(self._connection_state().encode())
+                    else:
+                        # What a real driver does when the serial node is
+                        # gone: an error message plus CONNECTION back Off
+                        # (measured on the AM3N power-cycle, 2026-09-03).
+                        writer.write((
+                            '<message device="Mount" message="[ERROR] Failed '
+                            'to connect to port. Error: Port failure."/>'
+                            + self._connection_state()).encode())
                     await writer.drain()
         except (ConnectionResetError, BrokenPipeError):
             return
 
-    def _definitions(self) -> str:
-        return (
-            f'<defNumberVector device="Mount" name="EQUATORIAL_EOD_COORD" state="Ok">'
-            f'<defNumber name="RA">{self.ra}</defNumber>'
-            f'<defNumber name="DEC">7.5</defNumber>'
-            f'</defNumberVector>'
-            f'<defSwitchVector device="Mount" name="TELESCOPE_TRACK_STATE" state="Ok">'
-            f'<defSwitch name="TRACK_ON">On</defSwitch>'
-            f'</defSwitchVector>')
+    def _connection_state(self) -> str:
+        on = "On" if self.driver_on else "Off"
+        off = "Off" if self.driver_on else "On"
+        return (f'<setSwitchVector device="Mount" name="CONNECTION" state="Ok">'
+                f'<oneSwitch name="CONNECT">{on}</oneSwitch>'
+                f'<oneSwitch name="DISCONNECT">{off}</oneSwitch>'
+                f'</setSwitchVector>')
+
+    def _definitions(self, name: str | None = None) -> str:
+        on = "On" if self.driver_on else "Off"
+        off = "Off" if self.driver_on else "On"
+        vectors = {
+            "CONNECTION": (
+                f'<defSwitchVector device="Mount" name="CONNECTION" state="Ok">'
+                f'<defSwitch name="CONNECT">{on}</defSwitch>'
+                f'<defSwitch name="DISCONNECT">{off}</defSwitch>'
+                f'</defSwitchVector>'),
+            "EQUATORIAL_EOD_COORD": (
+                f'<defNumberVector device="Mount" name="EQUATORIAL_EOD_COORD" state="Ok">'
+                f'<defNumber name="RA">{self.ra}</defNumber>'
+                f'<defNumber name="DEC">7.5</defNumber>'
+                f'</defNumberVector>'),
+            "TELESCOPE_TRACK_STATE": (
+                f'<defSwitchVector device="Mount" name="TELESCOPE_TRACK_STATE" state="Ok">'
+                f'<defSwitch name="TRACK_ON">On</defSwitch>'
+                f'</defSwitchVector>'),
+        }
+        if name is not None:
+            return vectors.get(name, "")
+        return "".join(vectors.values())
 
     async def push(self, blob: str) -> None:
         """Send raw INDI XML to every connected client."""
@@ -332,6 +378,70 @@ def test_messages_for_other_devices_are_not_logged() -> None:
     assert "mine" in msgs, "own-device message was dropped"
     assert "server notice" in msgs, "device-less server message was dropped"
     assert "theirs" not in msgs, "another device's message leaked into the log"
+
+
+def test_the_hook_fires_when_the_serial_link_returns_without_a_socket_drop() -> None:
+    """The 2026-09-03 mount-power-cycle miss: the socket to indiserver stayed
+    healthy through the whole outage; only the driver's CONNECTION went Off
+    and, once the port returned, back On. The hook (the telescope layer's
+    site/time re-send) must fire on that edge, or the mount comes back
+    running on its cold-boot January-2000 clock -- which is exactly what the
+    live drill found (TIME_UTC read 2000-01-01 after an otherwise clean
+    recovery)."""
+    async def run() -> int:
+        server, dev = await _rig()
+        fired = 0
+        async def hook() -> None:
+            nonlocal fired
+            fired += 1
+        dev.on_connected = hook
+        try:
+            # The driver loses the mount, then gets it back. No socket event.
+            await server.push(
+                '<setSwitchVector device="Mount" name="CONNECTION" state="Idle">'
+                '<oneSwitch name="CONNECT">Off</oneSwitch>'
+                '<oneSwitch name="DISCONNECT">On</oneSwitch></setSwitchVector>')
+            assert fired == 0, "fired on the way DOWN"
+            await server.push(
+                '<setSwitchVector device="Mount" name="CONNECTION" state="Ok">'
+                '<oneSwitch name="CONNECT">On</oneSwitch>'
+                '<oneSwitch name="DISCONNECT">Off</oneSwitch></setSwitchVector>')
+            assert await _settled(lambda: fired >= 1), \
+                "serial-only recovery never fired the hook; site/time not re-sent"
+            return fired
+        finally:
+            await dev.close()
+            await server.stop()
+
+    assert asyncio.run(run()) >= 1
+
+
+def test_a_dead_port_does_not_cause_a_connect_storm() -> None:
+    """Measured on the AM3N power-cycle, 2026-09-03: every failed CONNECT
+    publishes CONNECTION Off plus an error, and answering each update with
+    another CONNECT looped at same-millisecond speed -- flooding the log so
+    hard it destroyed its own scrollback record. Only the CONNECTION
+    *definition* may auto-connect; retries belong to the telescope layer's
+    paced _auto_reconnect."""
+    async def run() -> int:
+        server = FakeIndiServer()
+        server.driver_on = False        # defined, but not connected to the mount
+        server.port_ok = False          # and the serial node is gone
+        await server.start()
+        dev = IndiDevice("127.0.0.1", "Mount", server.port)
+        await dev.open()
+        try:
+            assert await _settled(lambda: server.connect_cmds >= 1), \
+                "the def-triggered connect never went out"
+            # The storm window: the old code sent dozens more within this.
+            await asyncio.sleep(0.5)
+            return server.connect_cmds
+        finally:
+            await dev.close()
+            await server.stop()
+
+    n = asyncio.run(run())
+    assert n == 1, f"expected the single def-triggered connect, got {n} (storm)"
 
 
 if __name__ == "__main__":
