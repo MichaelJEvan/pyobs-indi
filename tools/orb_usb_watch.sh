@@ -36,6 +36,10 @@
 
 set -u
 
+# Pin the window title; without this the terminal titles the pane after the
+# current foreground process, which is mostly "sleep".
+printf '\e]0;7 USB-WATCH\a'
+
 USB_ID="${USB_ID:-02100000}"                  # orb usb list shows it if it changes
 MACHINE="${MACHINE:-indi}"                    # the OrbStack VM running indiserver
 BY_ID="${BY_ID:-usb-ZWO_Systems_ZWO_Device_123456-if00}"   # the driver's saved port
