@@ -35,6 +35,7 @@ from pyobs.interfaces.IPointingRaDec import RaDecState
 from pyobs.interfaces.ITrackingMode import (TrackingMode, TrackingModeCapabilities,
                                             TrackingModeState)
 from pyobs.utils import exceptions as exc
+from pyobs.events import MoveRaDecEvent
 from pyobs.modules.telescope import BaseTelescope
 from pyobs.utils.enums import MotionStatus
 
@@ -243,6 +244,15 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
 
     async def open(self) -> None:
         await BaseTelescope.open(self)
+        # Declare the event our base class sends: BaseTelescope broadcasts
+        # MoveRaDecEvent at every slew start (basetelescope.py:392, 2.3.0)
+        # but never registers it, and subscription is gated on the sender
+        # ADVERTISING an event (xmppcomm._register_events checks
+        # _peer_sent_events) -- so without this line the event is published
+        # where nobody can ever subscribe. Same pattern as
+        # DummyRaDecTelescope registering OffsetsRaDecEvent. Measured
+        # 2026-09-06: NorthStar's registration got nothing until this.
+        await self.comm.register_event(MoveRaDecEvent)
         await self._indi.open()
         # Publish state before returning: pyobs verifies after open() that
         # every stateful interface has published something, and leaving it to
