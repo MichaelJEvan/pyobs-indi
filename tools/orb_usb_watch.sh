@@ -55,12 +55,34 @@ BACKOFF=30        # after a failed recovery, slow down instead of hammering
 
 log() { printf '%s  orb-usb-watch  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
+ORB_DEADLINE=15   # seconds an orb command may take before it is presumed hung
+
+# Run one orb command with a deadline. The orb CLI can hang forever (measured
+# 2026-09-08: one `orb ls` sat 15h47m and froze the whole loop -- a frozen
+# watcher is worse than none, because it looks alive). On timeout the command
+# is killed, the hang is logged to stderr (stdout may be feeding a pipe), and
+# the call reports failure; the loop carries on to the next poll.
+orb_dl() {
+    "$@" &
+    local cmd=$!
+    ( sleep "$ORB_DEADLINE"; kill "$cmd" 2>/dev/null ) &
+    local dog=$!
+    wait "$cmd"
+    local rc=$?
+    kill "$dog" 2>/dev/null
+    wait "$dog" 2>/dev/null
+    if [ "$rc" -ge 128 ]; then
+        log "orb call hung past ${ORB_DEADLINE}s and was killed: $*" >&2
+    fi
+    return "$rc"
+}
+
 vm_has_node() {
-    orb -m "$MACHINE" ls /dev/serial/by-id/ 2>/dev/null | grep -q "$BY_ID"
+    orb_dl orb -m "$MACHINE" ls /dev/serial/by-id/ 2>/dev/null | grep -q "$BY_ID"
 }
 
 mac_sees_device() {
-    orb usb list 2>/dev/null | grep -q "^$USB_ID"
+    orb_dl orb usb list 2>/dev/null | grep -q "^$USB_ID"
 }
 
 # Log on state changes only, like the module's edge-triggered warnings --
@@ -77,9 +99,9 @@ recover() {
     log "device present on the Mac but no serial node in the '$MACHINE' VM; re-attaching"
     # Best-effort: the stale-attach case needs this, the gone-from-registry
     # case errors on it. Either way the attach must still run.
-    orb usb detach "$USB_ID" >/dev/null 2>&1
+    orb_dl orb usb detach "$USB_ID" >/dev/null 2>&1
     sleep "$SETTLE"
-    if ! orb usb attach -m "$MACHINE" "$USB_ID"; then
+    if ! orb_dl orb usb attach -m "$MACHINE" "$USB_ID"; then
         log "attach refused; backing off ${BACKOFF}s"
         sleep "$BACKOFF"
         return
