@@ -147,8 +147,11 @@ cd ~/Development/Pyobs/pyobs-indi && ./tools/orb_usb_watch.sh
 Healthy: `serial node present; watching`, then silence -- it only speaks
 when something changes.
 
-**Stopping the watcher: Ctrl-C does not work on it** (the orb commands it
-runs interfere with the terminal). Stop it from the work window instead:
+**Stopping the watcher: Ctrl-C, in its own window.** (It used to refuse
+Ctrl-C: orb was leaving the terminal with its signal keys disabled. The
+script repairs the terminal after every orb call now -- fixed and verified
+2026-09-07.) If Ctrl-C ever refuses again, the fallback from the work
+window still works:
 
 ```
 pkill -f orb_usb_watch
@@ -211,8 +214,8 @@ Then close the windows, highest number first:
 - **Window 9 (GUI):** quit the app (Cmd-Q in the Qt window); the terminal
   returns to its prompt.
 - **Window 8 (CONSOLE):** type `q` at its prompt.
-- **Window 7 (USB-WATCH):** `pkill -f orb_usb_watch` in the work window
-  (Ctrl-C does not work on this one).
+- **Window 7 (USB-WATCH):** Ctrl-C (fixed 2026-09-07; if it ever refuses,
+  `pkill -f orb_usb_watch` from the work window).
 - **Window 6 (NORTHSTAR):** Ctrl-C.
 - **Window 5 (SIM-BRIDGE):** Ctrl-C.
 - **Window 4 (MOUNT-BRIDGE):** Ctrl-C.
