@@ -81,6 +81,14 @@ Healthy: `listening to port 7624`. If it says `bind: Address already in
 use` and quits, an old copy is running: `orb -m indi pkill indiserver` in
 the work window, then paste this again.
 
+**Reading this window's log:** `Client N: ... welcome!` and
+`Client N: shut down complete - bye!` are one CLIENT connecting and
+hanging up -- deceptive wording, but never the server dying. Every
+one-shot command is such a client (an indi_getprop check, a NorthStar
+fault button; NorthStar's NOISY mode produces a pair every 1-3 seconds
+for as long as it runs). The server itself exits only with a bare
+`good bye` and the window returning to a prompt.
+
 ### Window 2 -- MOUNT (necessary)
 
 ```
