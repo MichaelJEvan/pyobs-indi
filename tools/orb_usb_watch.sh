@@ -71,6 +71,10 @@ orb_dl() {
     local rc=$?
     kill "$dog" 2>/dev/null
     wait "$dog" 2>/dev/null
+    # orb can leave the terminal's newline handling scrambled (stair-stepped
+    # log lines, seen 2026-09-07 once orb ran under this wrapper); restore
+    # the settings after every call so the window stays readable.
+    [ -t 0 ] && stty sane 2>/dev/null
     if [ "$rc" -ge 128 ]; then
         log "orb call hung past ${ORB_DEADLINE}s and was killed: $*" >&2
     fi
