@@ -144,6 +144,43 @@ def test_current_mode_reads_off_the_switches() -> None:
     assert t._tracking_mode_now() == TrackingMode.OFF
 
 
+def _hdr_scope():
+    """_scope() plus the attributes the base header path reads that
+    BaseTelescope's/Module's __init__ would have set (the __new__ rig
+    skips them all). _observer None keeps the alt/az block out."""
+    t = _scope()
+    t._observer = None
+    t._tracked_body = None
+    t._tracked_elements = None
+    t._comm = None
+    t._fits_headers = {}
+    t._celestial_headers = {}
+    t._device_name = None
+    return t
+
+
+def test_fits_headers_carry_the_commanded_target() -> None:
+    """OBJRA/OBJDEC appear when a target is held (2026-09-08): the module
+    owns the commanded target and clients that restart must be able to ASK
+    -- upstream's headers carry only the pointed position."""
+    async def run():
+        t = _hdr_scope()
+        t._target = (206.885, 49.313)
+        return await t.get_fits_header_before()
+    hdr = asyncio.run(run())
+    assert "OBJRA" in hdr and abs(hdr["OBJRA"].value - 206.885) < 1e-9
+    assert "OBJDEC" in hdr and abs(hdr["OBJDEC"].value - 49.313) < 1e-9
+
+
+def test_fits_headers_stay_silent_without_a_target() -> None:
+    """No target, no OBJ keywords: a parked or idle mount must not claim
+    one (park clears _target; the header mirrors module truth)."""
+    async def run():
+        return await _hdr_scope().get_fits_header_before()
+    hdr = asyncio.run(run())
+    assert "OBJRA" not in hdr and "OBJDEC" not in hdr
+
+
 if __name__ == "__main__":
     tel_mod.POSITION_INTERVAL = 0.01
     tel_mod.UNPARK_TIMEOUT = 1.0

@@ -30,7 +30,7 @@ import astropy.units as u
 from astropy.coordinates import FK5, SkyCoord
 from astropy.time import Time
 
-from pyobs.interfaces import IPointingRaDec, ITrackingMode
+from pyobs.interfaces import FitsHeaderEntry, IPointingRaDec, ITrackingMode
 from pyobs.interfaces.IPointingRaDec import RaDecState
 from pyobs.interfaces.ITrackingMode import (TrackingMode, TrackingModeCapabilities,
                                             TrackingModeState)
@@ -843,6 +843,25 @@ class IndiTelescope(BaseTelescope, IPointingRaDec, ITrackingMode):
                         "(last driver messages: %s)", UNPARK_TIMEOUT,
                         "; ".join(self._indi.messages[-3:]) or "none")
         await self._change_motion_status(await self._get_status())
+
+    async def get_fits_header_before(
+        self, namespaces: list[str] | None = None, **kwargs: Any
+    ) -> dict[str, FitsHeaderEntry]:
+        """BaseTelescope's headers plus the commanded target as OBJRA/OBJDEC
+        (degrees, J2000). Upstream publishes only the pointed position
+        (TEL-RA/TEL-DEC); the commanded target exists nowhere on the bus
+        (checked 2026-09-08), yet this module owns it -- and a client that
+        restarts needs to ASK rather than remember: NorthStar's drift
+        recorder went dark after every restart until this existed. Standard
+        target keywords in the frame headers are their own reward once a
+        camera arrives.
+        """
+        hdr = await super().get_fits_header_before(namespaces, **kwargs)
+        if self._target is not None:
+            ra, dec = self._target
+            hdr["OBJRA"] = FitsHeaderEntry(float(ra), "Commanded target RA [deg, J2000]")
+            hdr["OBJDEC"] = FitsHeaderEntry(float(dec), "Commanded target Dec [deg, J2000]")
+        return hdr
 
     async def park(self, **kwargs: Any) -> None:
         """Park, and only report done once the mount has stopped moving.
