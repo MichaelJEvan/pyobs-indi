@@ -65,7 +65,11 @@ ORB_DEADLINE=15   # seconds an orb command may take before it is presumed hung
 orb_dl() {
     "$@" &
     local cmd=$!
-    ( sleep "$ORB_DEADLINE"; kill "$cmd" 2>/dev/null ) &
+    # TERM then KILL: orb can absorb a plain TERM (measured 2026-09-07 --
+    # an `orb -m indi ls` shrugged off the watchdog's kill and sat 13.5 h,
+    # freezing the loop while a mount power-cycle went unhandled).
+    ( sleep "$ORB_DEADLINE"; kill "$cmd" 2>/dev/null
+      sleep 2; kill -9 "$cmd" 2>/dev/null ) &
     local dog=$!
     wait "$cmd"
     local rc=$?
